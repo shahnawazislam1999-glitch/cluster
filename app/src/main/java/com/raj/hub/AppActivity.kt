@@ -5,6 +5,10 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -120,6 +124,40 @@ class AppActivity : AppCompatActivity() {
         val info = readVideoInfo(uri)
         val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
         val key = app.id
+
+        // MKV is a container that Android WebView's HTML video element does not
+        // reliably play. Convert the container to MP4 without re-encoding so a
+        // 3 GB H.264/AAC MKV keeps the same quality.
+        if (info.first.lowercase().endsWith(".mkv")) {
+            deletePrivateVideo(key)
+            runOnUiThread {
+                Toast.makeText(this, "Preparing MKV for smooth playback… This may take a while for a 3 GB file.", Toast.LENGTH_LONG).show()
+            }
+            Bg.run {
+                try {
+                    val out = remuxMkvToMp4(uri, key, info.first)
+                    sp.edit()
+                        .remove("vid_uri_$key")
+                        .putString("vid_path_$key", out.absolutePath)
+                        .putString("vid_name_$key", out.name)
+                        .putLong("vid_size_$key", out.length())
+                        .putLong("vid_stamp_$key", System.currentTimeMillis())
+                        .apply()
+                    runOnUiThread {
+                        Toast.makeText(this, "MKV ready. Original quality preserved; video will stay after reopening AppCluster.", Toast.LENGTH_LONG).show()
+                        sendSavedVideoToPage(false)
+                    }
+                } catch (e: Exception) {
+                    Log.e("RajHubVideo", "MKV to MP4 remux failed", e)
+                    runOnUiThread {
+                        Toast.makeText(this, "This MKV cannot be prepared automatically (${e.message ?: "unsupported codec/container"}). Use MP4 H.264 + AAC.", Toast.LENGTH_LONG).show()
+                        sendSavedVideoToPage(false)
+                    }
+                }
+            }
+            return@registerForActivityResult
+        }
+
         var persisted = false
         try {
             val flags = (r.data?.flags ?: 0) and Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -132,9 +170,7 @@ class AppActivity : AppCompatActivity() {
             persisted = false
         }
 
-        // Remove any previous private fallback first.
         deletePrivateVideo(key)
-
         if (persisted) {
             sp.edit()
                 .putString("vid_uri_$key", uri.toString())
@@ -145,8 +181,6 @@ class AppActivity : AppCompatActivity() {
                 .apply()
             sendSavedVideoToPage(false)
         } else {
-            // Some gallery/cloud providers grant only temporary access. Copy once into
-            // the app's private storage so the selected video survives app restarts.
             runOnUiThread { Toast.makeText(this, "Saving video for future launches…", Toast.LENGTH_SHORT).show() }
             Bg.run {
                 try {
@@ -166,15 +200,9 @@ class AppActivity : AppCompatActivity() {
                             }
                         }
                     } ?: throw IOException("Could not read selected video")
-
-                    sp.edit()
-                        .remove("vid_uri_$key")
-                        .putString("vid_path_$key", dst.absolutePath)
-                        .putString("vid_name_$key", info.first)
-                        .putLong("vid_size_$key", if (info.second > 0) info.second else dst.length())
-                        .putLong("vid_stamp_$key", System.currentTimeMillis())
-                        .apply()
-
+                    sp.edit().remove("vid_uri_$key").putString("vid_path_$key", dst.absolutePath)
+                        .putString("vid_name_$key", info.first).putLong("vid_size_$key", if (info.second > 0) info.second else dst.length())
+                        .putLong("vid_stamp_$key", System.currentTimeMillis()).apply()
                     runOnUiThread {
                         Toast.makeText(this, "Video saved. It will stay available after reopening AppCluster.", Toast.LENGTH_LONG).show()
                         sendSavedVideoToPage(false)
@@ -241,6 +269,85 @@ class AppActivity : AppCompatActivity() {
             }
         }
         return Pair(name, size)
+    }
+
+
+    /**
+     * Android WebView's HTML <video> support is much more reliable with MP4 than MKV.
+     * For MKV files we remux the existing video/audio tracks into MP4 without decoding
+     * or re-encoding. This keeps the original quality and avoids loading the 3 GB file
+     * into RAM. If the codecs themselves are unsupported, remuxing cannot fix that.
+     */
+    private fun remuxMkvToMp4(uri: Uri, appId: String, originalName: String): File {
+        val dir = File(filesDir, "remembered_videos").apply { mkdirs() }
+        val safeBase = originalName.substringBeforeLast('.', originalName.ifBlank { "video" })
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .ifBlank { "video" }
+        val out = File(dir, "${appId}_${System.currentTimeMillis()}_${safeBase}.mp4")
+        val extractor = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        var sourcePfd: ParcelFileDescriptor? = null
+        val trackMap = HashMap<Int, Int>()
+        try {
+            sourcePfd = contentResolver.openFileDescriptor(uri, "r")
+                ?: throw IOException("Could not open MKV")
+            // Keep the descriptor open for the entire extraction; MediaExtractor uses it lazily.
+            extractor.setDataSource(sourcePfd!!.fileDescriptor)
+
+            var videoFormat: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+                    if (mime.startsWith("video/") && videoFormat == null) videoFormat = format
+                    if (muxer == null) muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                    trackMap[i] = muxer!!.addTrack(format)
+                }
+            }
+            if (videoFormat == null) throw IOException("MKV has no video track")
+            if (trackMap.isEmpty()) throw IOException("MKV has no playable audio/video tracks")
+
+            val rotation = try {
+                if (videoFormat!!.containsKey(MediaFormat.KEY_ROTATION)) videoFormat!!.getInteger(MediaFormat.KEY_ROTATION) else 0
+            } catch (_: Exception) { 0 }
+            if (rotation == 90 || rotation == 180 || rotation == 270) {
+                try { muxer?.setOrientationHint(rotation) } catch (_: Exception) {}
+            }
+
+            muxer?.start() ?: throw IOException("Could not create MP4")
+            for (track in trackMap.keys) extractor.selectTrack(track)
+
+            val buffer = java.nio.ByteBuffer.allocateDirect(1024 * 1024)
+            val info = MediaCodec.BufferInfo()
+            while (true) {
+                val inputTrack = extractor.sampleTrackIndex
+                if (inputTrack < 0) break
+                val outputTrack = trackMap[inputTrack]
+                if (outputTrack == null) {
+                    extractor.advance()
+                    continue
+                }
+                info.offset = 0
+                info.size = extractor.readSampleData(buffer, 0)
+                if (info.size < 0) break
+                info.presentationTimeUs = extractor.sampleTime
+                info.flags = extractor.sampleFlags
+                muxer?.writeSampleData(outputTrack, buffer, info)
+                extractor.advance()
+            }
+            muxer?.stop()
+            muxer = null
+            if (!out.isFile || out.length() == 0L) throw IOException("MP4 output is empty")
+            return out
+        } catch (e: Exception) {
+            try { muxer?.stop() } catch (_: Exception) {}
+            try { muxer?.release() } catch (_: Exception) {}
+            try { out.delete() } catch (_: Exception) {}
+            throw e
+        } finally {
+            try { extractor.release() } catch (_: Exception) {}
+            try { sourcePfd?.close() } catch (_: Exception) {}
+        }
     }
 
     /** JSON for the remembered video, or "" when there is none or it is no longer readable. */
