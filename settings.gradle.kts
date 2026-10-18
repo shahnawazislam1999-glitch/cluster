@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "RajAppStore"
+rootProject.name = "AppCluster"
 include(":app")

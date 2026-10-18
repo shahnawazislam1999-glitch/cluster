@@ -5,6 +5,143 @@
     android:background="@color/bg"
     android:orientation="vertical">
 
+    <!-- ==== ANCHOR: LOBBY HEADER (logo, title, permissions button) ==== -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="20dp"
+        android:paddingTop="24dp"
+        android:paddingEnd="20dp">
+
+        <ImageView
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:background="@drawable/logo_tile"
+            android:contentDescription="@null"
+            android:src="@drawable/ic_launcher_foreground" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="14dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="sans-serif-medium"
+                android:text="@string/app_name"
+                android:textColor="@color/text"
+                android:textSize="26sp" />
+
+            <TextView
+                android:id="@+id/subtitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/sub"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <FrameLayout
+            android:layout_width="48dp"
+            android:layout_height="48dp">
+
+            <ImageView
+                android:id="@+id/permBtn"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:layout_gravity="center"
+                android:background="@drawable/circle_btn"
+                android:clickable="true"
+                android:contentDescription="Permissions"
+                android:focusable="true"
+                android:padding="11dp"
+                android:src="@drawable/ic_shield"
+                android:tint="@color/text" />
+
+            <View
+                android:id="@+id/permDot"
+                android:layout_width="13dp"
+                android:layout_height="13dp"
+                android:layout_gravity="top|end"
+                android:layout_marginTop="2dp"
+                android:layout_marginEnd="2dp"
+                android:background="@drawable/dot_red"
+                android:visibility="gone" />
+        </FrameLayout>
+    </LinearLayout>
+
+    <!-- ==== ANCHOR: LOBBY SEARCH BAR ==== -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="20dp"
+        android:layout_marginEnd="20dp"
+        android:background="@drawable/search_bg"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="14dp"
+        android:paddingEnd="6dp">
+
+        <ImageView
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:contentDescription="@null"
+            android:src="@drawable/ic_search"
+            android:tint="@color/sub" />
+
+        <EditText
+            android:id="@+id/search"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:layout_weight="1"
+            android:background="@null"
+            android:hint="Search apps"
+            android:imeOptions="actionSearch"
+            android:inputType="text"
+            android:maxLines="1"
+            android:paddingTop="13dp"
+            android:paddingBottom="13dp"
+            android:textColor="@color/text"
+            android:textColorHint="@color/sub"
+            android:textSize="15sp" />
+
+        <ImageView
+            android:id="@+id/clear"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:clickable="true"
+            android:contentDescription="Clear search"
+            android:focusable="true"
+            android:padding="10dp"
+            android:src="@drawable/ic_close"
+            android:tint="@color/sub"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- ==== ANCHOR: LOBBY FILTER CHIPS (All / Favorites / Downloaded / Need download) ==== -->
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:overScrollMode="never"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:id="@+id/chips"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingStart="20dp"
+            android:paddingEnd="12dp" />
+    </HorizontalScrollView>
+
+    <!-- ==== ANCHOR: LOBBY APP LIST ==== -->
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -17,57 +154,9 @@
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:paddingStart="20dp"
-            android:paddingTop="28dp"
+            android:paddingTop="6dp"
             android:paddingEnd="20dp"
             android:paddingBottom="12dp">
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <ImageView
-                    android:layout_width="52dp"
-                    android:layout_height="52dp"
-                    android:background="@drawable/logo_tile"
-                    android:contentDescription="@null"
-                    android:src="@drawable/ic_launcher_foreground" />
-
-                <LinearLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="14dp"
-                    android:layout_weight="1"
-                    android:orientation="vertical">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:fontFamily="sans-serif-medium"
-                        android:text="@string/app_name"
-                        android:textColor="@color/text"
-                        android:textSize="26sp" />
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="@string/choose_app"
-                        android:textColor="@color/sub"
-                        android:textSize="14sp" />
-                </LinearLayout>
-            </LinearLayout>
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="32dp"
-                android:layout_marginBottom="14dp"
-                android:fontFamily="sans-serif-medium"
-                android:letterSpacing="0.15"
-                android:text="YOUR APPS"
-                android:textColor="@color/sub"
-                android:textSize="12sp" />
 
             <LinearLayout
                 android:id="@+id/list"
@@ -76,10 +165,21 @@
                 android:orientation="vertical" />
 
             <TextView
+                android:id="@+id/empty"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:paddingTop="48dp"
+                android:paddingBottom="24dp"
+                android:textColor="@color/sub"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:text="Tip: press and hold an app to update or remove its offline copy."
+                android:layout_marginTop="4dp"
+                android:text="Tip: tap ☆ to favorite, tap the pin to keep an app on top, press and hold for more."
                 android:textColor="@color/sub"
                 android:textSize="12sp" />
         </LinearLayout>

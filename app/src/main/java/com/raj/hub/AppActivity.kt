@@ -1,7 +1,9 @@
 package com.raj.hub
 
+import android.Manifest
 import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -13,7 +15,9 @@ import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -25,6 +29,8 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -90,6 +96,63 @@ class AppActivity : AppCompatActivity() {
         cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
     }
 
+    // ==== ANCHOR: web page camera / microphone / location permission requests ====
+    private var pendingWebReq: PermissionRequest? = null
+    private var pendingGeoOrigin: String? = null
+    private var pendingGeoCb: GeolocationPermissions.Callback? = null
+
+    private fun has(perm: String): Boolean =
+        ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
+
+    private val webPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            val req = pendingWebReq
+            pendingWebReq = null
+            if (req != null) answerWebPermission(req)
+        }
+
+    private val geoLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            val cb = pendingGeoCb
+            val origin = pendingGeoOrigin
+            pendingGeoCb = null
+            pendingGeoOrigin = null
+            val ok = has(Manifest.permission.ACCESS_FINE_LOCATION) || has(Manifest.permission.ACCESS_COARSE_LOCATION)
+            cb?.invoke(origin, ok, false)
+        }
+
+    /** Gives the page the camera / microphone it asked for, if Android allows it. */
+    private fun answerWebPermission(req: PermissionRequest) {
+        val ok = ArrayList<String>()
+        for (r in req.resources) {
+            when (r) {
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> if (has(Manifest.permission.CAMERA)) ok.add(r)
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> if (has(Manifest.permission.RECORD_AUDIO)) ok.add(r)
+                else -> ok.add(r)
+            }
+        }
+        if (ok.isEmpty()) req.deny() else req.grant(ok.toTypedArray())
+    }
+
+    private fun handleWebPermission(req: PermissionRequest) {
+        val missing = ArrayList<String>()
+        for (r in req.resources) {
+            if (r == PermissionRequest.RESOURCE_VIDEO_CAPTURE && !has(Manifest.permission.CAMERA)) {
+                missing.add(Manifest.permission.CAMERA)
+            }
+            if (r == PermissionRequest.RESOURCE_AUDIO_CAPTURE && !has(Manifest.permission.RECORD_AUDIO)) {
+                missing.add(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+        if (missing.isEmpty()) {
+            answerWebPermission(req)
+            return
+        }
+        pendingWebReq?.deny()
+        pendingWebReq = req
+        webPermLauncher.launch(missing.toTypedArray())
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = AppStore(this)
@@ -104,7 +167,11 @@ class AppActivity : AppCompatActivity() {
         app = found
 
         val lp = window.attributes
-        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        lp.layoutInDisplayCutoutMode = if (android.os.Build.VERSION.SDK_INT >= 30) {
+            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else {
+            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         window.attributes = lp
 
         root = FrameLayout(this)
@@ -112,6 +179,16 @@ class AppActivity : AppCompatActivity() {
         web = WebView(this)
         root.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(root)
+
+        // Full screen: the page draws edge to edge (under the camera notch too). Only the keyboard pushes it up.
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        if (android.os.Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
+        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            v.setPadding(0, 0, 0, ime.bottom)
+            insets
+        }
 
         loader = WebViewAssetLoader.Builder()
             .setDomain(app.host)
@@ -155,6 +232,7 @@ class AppActivity : AppCompatActivity() {
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
         s.textZoom = 100
+        s.setGeolocationEnabled(true)
 
         web.setBackgroundColor(Color.parseColor("#0B1020"))
         web.addJavascriptInterface(Bridge(), "RajBridge")
@@ -201,6 +279,25 @@ class AppActivity : AppCompatActivity() {
 
             override fun onHideCustomView() {
                 hideCustomView()
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                val req = request ?: return
+                runOnUiThread { handleWebPermission(req) }
+            }
+
+            override fun onGeolocationPermissionsShowPrompt(origin: String?, callback: GeolocationPermissions.Callback?) {
+                val cb = callback ?: return
+                if (has(Manifest.permission.ACCESS_FINE_LOCATION) || has(Manifest.permission.ACCESS_COARSE_LOCATION)) {
+                    cb.invoke(origin, true, false)
+                    return
+                }
+                pendingGeoCb?.invoke(pendingGeoOrigin, false, false)
+                pendingGeoCb = cb
+                pendingGeoOrigin = origin
+                geoLauncher.launch(
+                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+                )
             }
 
             override fun onShowFileChooser(
@@ -288,7 +385,8 @@ class AppActivity : AppCompatActivity() {
     }
 
     private fun hideSystemBars() {
-        WindowCompat.setDecorFitsSystemWindows(window, true)
+        // ==== ANCHOR: AppActivity.hideSystemBars (full screen, no top bar) ====
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         val c = WindowInsetsControllerCompat(window, window.decorView)
         c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         c.hide(WindowInsetsCompat.Type.systemBars())
@@ -321,8 +419,13 @@ class AppActivity : AppCompatActivity() {
         }
     }
 
-    /** Called from the page's JavaScript to save a file into Downloads/RajHub. */
+    /** Called from the page's JavaScript: save a file into Downloads/AppCluster, or show a notification. */
     private inner class Bridge {
+        @JavascriptInterface
+        fun notify(title: String, text: String) {
+            Notifier.show(this@AppActivity, title, text)
+        }
+
         @JavascriptInterface
         fun save(name: String, mime: String, base64: String) {
             Bg.run {
@@ -332,7 +435,7 @@ class AppActivity : AppCompatActivity() {
                     val values = ContentValues()
                     values.put(MediaStore.Downloads.DISPLAY_NAME, safe)
                     values.put(MediaStore.Downloads.MIME_TYPE, if (mime.isBlank()) "application/octet-stream" else mime)
-                    values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/RajAppStore")
+                    values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AppCluster")
                     values.put(MediaStore.Downloads.IS_PENDING, 1)
                     val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                         ?: throw IOException("Could not create file")
@@ -342,7 +445,7 @@ class AppActivity : AppCompatActivity() {
                     done.put(MediaStore.Downloads.IS_PENDING, 0)
                     contentResolver.update(uri, done, null, null)
                     runOnUiThread {
-                        Toast.makeText(this@AppActivity, "Saved to Downloads/RajAppStore/$safe", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this@AppActivity, "Saved to Downloads/AppCluster/$safe", Toast.LENGTH_LONG).show()
                     }
                 } catch (e: Exception) {
                     runOnUiThread {

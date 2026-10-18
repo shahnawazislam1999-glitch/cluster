@@ -1,4 +1,4 @@
-name: Build Raj App Store APK
+name: Build App Cluster APK
 
 on:
   push:
@@ -32,21 +32,21 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk dist/RajAppStore.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/AppCluster.apk
           ls -la dist
 
       - name: Upload APK (Actions artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: RajAppStore-apk
-          path: dist/RajAppStore.apk
+          name: AppCluster-apk
+          path: dist/AppCluster.apk
 
       - name: Publish APK to the "latest" release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --cleanup-tag --yes || true
-          gh release create latest dist/RajAppStore.apk \
-            --title "Raj App Store (latest build)" \
-            --notes "Latest signed APK. Download RajAppStore.apk and install it on your phone." \
+          gh release create latest dist/AppCluster.apk \
+            --title "App Cluster (latest build)" \
+            --notes "Latest signed APK. Download AppCluster.apk and install it on your phone." \
             --latest

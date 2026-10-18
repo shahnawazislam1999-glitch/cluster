@@ -1,10 +1,17 @@
 package com.raj.hub
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
+import android.os.Build
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.webkit.WebResourceResponse
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
@@ -47,6 +54,29 @@ object Prefs {
         if (id == null) e.remove("last_app") else e.putString("last_app", id)
         e.apply()
     }
+
+    // ==== ANCHOR: Prefs favorites / pins / first-run flag ====
+    private fun idSet(c: Context, key: String): Set<String> =
+        p(c).getStringSet(key, emptySet())?.toSet() ?: emptySet()
+
+    private fun toggle(c: Context, key: String, id: String): Boolean {
+        val s = idSet(c, key).toMutableSet()
+        val nowOn = if (s.contains(id)) { s.remove(id); false } else { s.add(id); true }
+        p(c).edit().putStringSet(key, s).apply()
+        return nowOn
+    }
+
+    fun favorites(c: Context): Set<String> = idSet(c, "favs")
+    fun pins(c: Context): Set<String> = idSet(c, "pins")
+
+    /** Returns true when the app is now a favorite. */
+    fun toggleFavorite(c: Context, id: String): Boolean = toggle(c, "favs", id)
+
+    /** Returns true when the app is now pinned to the top. */
+    fun togglePin(c: Context, id: String): Boolean = toggle(c, "pins", id)
+
+    fun permsShown(c: Context): Boolean = p(c).getBoolean("perms_shown", false)
+    fun setPermsShown(c: Context) { p(c).edit().putBoolean("perms_shown", true).apply() }
 
     fun lastCheck(c: Context, id: String): Long = p(c).getLong("chk_$id", 0L)
 
@@ -98,6 +128,55 @@ object Net {
             return c.inputStream.bufferedReader().use { it.readText() }
         } finally {
             c.disconnect()
+        }
+    }
+}
+
+/** Decides where the app goes after the splash / permission screen. */
+object Router {
+    fun next(ctx: Context): Intent {
+        val last = Prefs.lastApp(ctx)
+        val store = AppStore(ctx)
+        val target = AppRegistry.load(ctx).firstOrNull { it.id == last && store.isInstalled(it) }
+        return if (target != null) {
+            Intent(ctx, AppActivity::class.java).putExtra(AppActivity.EXTRA_ID, target.id)
+        } else {
+            Intent(ctx, LobbyActivity::class.java)
+        }
+    }
+}
+
+/** Lets a web app show an Android notification (page calls RajBridge.notify(title, text)). */
+object Notifier {
+    private const val CHANNEL = "cluster_general"
+
+    private fun ensureChannel(ctx: Context) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, "App Cluster", NotificationManager.IMPORTANCE_DEFAULT)
+            )
+        }
+    }
+
+    fun show(ctx: Context, title: String, text: String) {
+        val nm = NotificationManagerCompat.from(ctx)
+        if (!nm.areNotificationsEnabled()) return
+        ensureChannel(ctx)
+        val open = Intent(ctx, SplashActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pi = PendingIntent.getActivity(ctx, 0, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val n = NotificationCompat.Builder(ctx, CHANNEL)
+            .setSmallIcon(R.drawable.ic_notify)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setAutoCancel(true)
+            .setContentIntent(pi)
+            .build()
+        try {
+            nm.notify((System.currentTimeMillis() % 100000).toInt(), n)
+        } catch (e: SecurityException) {
+            // notification permission was revoked
         }
     }
 }

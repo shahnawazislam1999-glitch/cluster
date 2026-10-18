@@ -7,7 +7,7 @@ import android.os.Looper
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 
-/** Shows the Raj Hub logo with "from Raj", then jumps to the last used app (or the lobby). */
+/** Shows the App Cluster logo with "from Raj", then goes to the Permission Center (first launch only), the last used app, or the lobby. */
 class SplashActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -26,13 +26,11 @@ class SplashActivity : AppCompatActivity() {
 
     private fun route() {
         if (isFinishing || isDestroyed) return
-        val last = Prefs.lastApp(this)
-        val store = AppStore(this)
-        val target = AppRegistry.load(this).firstOrNull { it.id == last && store.isInstalled(it) }
-        val next = if (target != null) {
-            Intent(this, AppActivity::class.java).putExtra(AppActivity.EXTRA_ID, target.id)
+        val next = if (!Prefs.permsShown(this)) {
+            // First launch: show the Permission Center once.
+            Intent(this, PermissionsActivity::class.java).putExtra(PermissionsActivity.EXTRA_FIRST, true)
         } else {
-            Intent(this, LobbyActivity::class.java)
+            Router.next(this)
         }
         startActivity(next)
         finish()
