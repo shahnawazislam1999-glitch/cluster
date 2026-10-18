@@ -15,7 +15,12 @@ import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.util.Log
+import android.webkit.ConsoleMessage
 import android.webkit.GeolocationPermissions
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
@@ -24,10 +29,12 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -51,13 +58,14 @@ class AppActivity : AppCompatActivity() {
   window.__rajHook = true;
   function send(url, name) {
     fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
+      if (b.size > 120 * 1024 * 1024) { alert('This file is too big to save from inside the app.'); return; }
       var fr = new FileReader();
       fr.onloadend = function () {
         var s = String(fr.result);
         RajBridge.save(name || 'download', b.type || 'application/octet-stream', s.substring(s.indexOf(',') + 1));
       };
       fr.readAsDataURL(b);
-    });
+    }).catch(function () { alert('Could not save the file.'); });
   }
   var origClick = HTMLAnchorElement.prototype.click;
   HTMLAnchorElement.prototype.click = function () {
@@ -227,12 +235,18 @@ class AppActivity : AppCompatActivity() {
         s.databaseEnabled = true
         s.mediaPlaybackRequiresUserGesture = false
         s.allowFileAccess = false
-        s.allowContentAccess = false
+        // Needed so the Android file picker's content:// files (big MKV, SRT) can be read by the page
+        s.allowContentAccess = true
         s.useWideViewPort = true
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
         s.textZoom = 100
         s.setGeolocationEnabled(true)
+        s.loadWithOverviewMode = false
+        s.setSupportZoom(false)
+        s.builtInZoomControls = false
+        // Lets you debug the page from Chrome on a PC: chrome://inspect (USB debugging)
+        WebView.setWebContentsDebuggingEnabled(true)
 
         web.setBackgroundColor(Color.parseColor("#0B1020"))
         web.addJavascriptInterface(Bridge(), "RajBridge")
@@ -262,6 +276,17 @@ class AppActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 view?.evaluateJavascript(DOWNLOAD_HOOK_JS, null)
             }
+
+            // A very big video can make Android kill the page's render process. Without this the whole app crashes.
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                Toast.makeText(this@AppActivity, "The page ran out of memory and was restarted.", Toast.LENGTH_LONG).show()
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed) {
+                        try { web.loadUrl("https://${app.host}/${app.entry}") } catch (e: Exception) { goToLobby() }
+                    }
+                }
+                return true
+            }
         }
 
         web.webChromeClient = object : WebChromeClient() {
@@ -279,6 +304,50 @@ class AppActivity : AppCompatActivity() {
 
             override fun onHideCustomView() {
                 hideCustomView()
+            }
+
+            override fun onConsoleMessage(m: ConsoleMessage?): Boolean {
+                if (m != null) Log.d("RajHubWeb", "${m.message()} (${m.sourceId()}:${m.lineNumber()})")
+                return true
+            }
+
+            override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                val r = result ?: return false
+                if (isFinishing || isDestroyed) { r.cancel(); return true }
+                AlertDialog.Builder(this@AppActivity)
+                    .setMessage(message ?: "")
+                    .setPositiveButton(android.R.string.ok) { _, _ -> r.confirm() }
+                    .setOnCancelListener { r.cancel() }
+                    .show()
+                return true
+            }
+
+            override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                val r = result ?: return false
+                if (isFinishing || isDestroyed) { r.cancel(); return true }
+                AlertDialog.Builder(this@AppActivity)
+                    .setMessage(message ?: "")
+                    .setPositiveButton(android.R.string.ok) { _, _ -> r.confirm() }
+                    .setNegativeButton(android.R.string.cancel) { _, _ -> r.cancel() }
+                    .setOnCancelListener { r.cancel() }
+                    .show()
+                return true
+            }
+
+            override fun onJsPrompt(view: WebView?, url: String?, message: String?, defaultValue: String?, result: JsPromptResult?): Boolean {
+                val r = result ?: return false
+                if (isFinishing || isDestroyed) { r.cancel(); return true }
+                val input = EditText(this@AppActivity)
+                input.setText(defaultValue ?: "")
+                input.setSelection(input.text.length)
+                AlertDialog.Builder(this@AppActivity)
+                    .setMessage(message ?: "")
+                    .setView(input)
+                    .setPositiveButton(android.R.string.ok) { _, _ -> r.confirm(input.text.toString()) }
+                    .setNegativeButton(android.R.string.cancel) { _, _ -> r.cancel() }
+                    .setOnCancelListener { r.cancel() }
+                    .show()
+                return true
             }
 
             override fun onPermissionRequest(request: PermissionRequest?) {
@@ -309,11 +378,22 @@ class AppActivity : AppCompatActivity() {
                 fileCallback?.onReceiveValue(null)
                 fileCallback = filePathCallback
                 return try {
-                    chooser.launch(fileChooserParams.createIntent())
+                    val intent = try {
+                        fileChooserParams.createIntent()
+                    } catch (e: Exception) {
+                        Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE)
+                    }
+                    // Never filter by type: .srt has no Android MIME type and big .mkv files are often hidden by filters.
+                    intent.type = "*/*"
+                    intent.removeExtra(Intent.EXTRA_MIME_TYPES)
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    chooser.launch(intent)
                     true
                 } catch (e: Exception) {
+                    fileCallback?.onReceiveValue(null)
                     fileCallback = null
-                    false
+                    Toast.makeText(this@AppActivity, "Could not open the file picker", Toast.LENGTH_SHORT).show()
+                    true
                 }
             }
 
