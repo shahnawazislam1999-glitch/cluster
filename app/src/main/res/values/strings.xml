@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Raj App Store</string>
+    <string name="tagline">Your apps. One place.</string>
+    <string name="choose_app">Choose an app to continue</string>
+    <string name="from_label">from</string>
+    <string name="from_name">RAJ</string>
+</resources>
