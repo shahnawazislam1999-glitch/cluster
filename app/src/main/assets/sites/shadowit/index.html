@@ -2977,7 +2977,7 @@ html.pen-annotate-on #penAnnotateCanvas{display:block;}
       </div>
       <div id="videoContainer" style="display: none;">
          <div id="videoStage">
-            <div id="videoShake"><video id="videoPlayer" controls="" playsinline="" webkit-playsinline="" preload="metadata"></video></div>
+            <div id="videoShake"><video id="videoPlayer" controls="" playsinline="" webkit-playsinline="" preload="metadata"></video><div id="videoStatus" style="display:none;margin:6px 4px 0;padding:8px 10px;border-radius:8px;background:#fff7ed;color:#9a3412;font:600 13px/1.4 system-ui,sans-serif;"></div></div>
             <div id="oldTvOverlay" aria-hidden="true">
                <div class="otv-noise"></div>
                <div class="otv-scratches"></div>
@@ -4225,9 +4225,14 @@ loadVideoBtn.addEventListener('click', () => {
 });
 
 let nativeRetry = 0;
+function setVideoStatus(t) {
+    const d = document.getElementById('videoStatus'); if (!d) return;
+    d.textContent = t || ''; d.style.display = t ? 'block' : 'none';
+}
+videoPlayer.addEventListener('loadeddata', () => setVideoStatus(''));
 // Called by the Android app while it copies a video into its own storage (only when Android refuses to remember the file).
 window.__onNativeVideoProgress = function (pct, text) {
-    try { currentSentenceDiv.innerText = text || ('Saving video inside the app... ' + pct + '%'); } catch (e) {}
+    setVideoStatus(text || ('Saving video inside the app... ' + pct + '%'));
 };
 // Called by the Android app after you pick a video (and again on every app start for the remembered one).
 window.__onNativeVideo = function (info) {
@@ -4237,13 +4242,12 @@ window.__onNativeVideo = function (info) {
         isRestoringVideo = false;
         nativeRetry = 0;
         if (info.missing) {
-            // The app remembers the choice but Android can no longer open the file (moved / deleted / permission lost).
-            // Say so clearly instead of silently showing nothing.
             nativeVideoInfo = null;
-            currentSentenceDiv.innerText = 'Saved video "' + info.name + '" cannot be opened now (file moved or deleted). Tap 🎬+ and pick it once again - it will be remembered.';
+            setVideoStatus('Saved video "' + info.name + '" cannot be opened now (file moved or deleted). Tap 🎬+ and pick it once again.');
             return;
         }
         nativeVideoInfo = info;
+        setVideoStatus('Loading video: ' + info.name + ' ...');
         currentVideoBlob = null;
         if (currentVideoUrl && String(currentVideoUrl).indexOf('blob:') === 0) { try { URL.revokeObjectURL(currentVideoUrl); } catch (e) {} }
         currentVideoUrl = location.origin + '/__video__?v=' + (info.stamp || Date.now());
@@ -4267,6 +4271,7 @@ window.__onNativeVideo = function (info) {
             if (window.RajBridge && typeof window.RajBridge.getSavedVideo === 'function') {
                 const j = window.RajBridge.getSavedVideo();
                 if (j) { const o = JSON.parse(j); o.restored = true; window.__onNativeVideo(o); }
+                else setVideoStatus('No video is remembered yet. Tap the 🎬+ button, pick your video once, and it will stay.');
             }
         } catch (e) { console.warn('Saved video restore failed:', e); }
     }, 50);
@@ -4313,12 +4318,11 @@ videoUpload.addEventListener('change', (e) => {
     }
 });
 
-videoPlayer.addEventListener('loadedmetadata', () => { nativeRetry = 0; });
+videoPlayer.addEventListener('loadedmetadata', () => { nativeRetry = 0; setVideoStatus(''); });
 // Friendly message when the phone's player cannot decode the file (common for MKV with HEVC / AC3 / DTS).
 videoPlayer.addEventListener('error', () => {
     const er = videoPlayer.error; if (!er || (!currentVideoBlob && !nativeVideoInfo)) return;
     if (nativeVideoInfo && (er.code === 4 || er.code === 2)) {
-        // A first request can fail while Android is still waking up the storage: retry twice before giving up.
         if (nativeRetry < 2) {
             nativeRetry++;
             const n = nativeRetry;
@@ -4334,9 +4338,9 @@ videoPlayer.addEventListener('error', () => {
         }
         let again = null;
         try { if (window.RajBridge && window.RajBridge.getSavedVideo) again = JSON.parse(window.RajBridge.getSavedVideo() || 'null'); } catch (e) {}
-        currentSentenceDiv.innerText = (again && again.missing)
+        setVideoStatus((again && again.missing)
             ? 'Saved video file was moved or deleted. Tap 🎬+ and pick it again.'
-            : 'This phone could not play the saved video (codec not supported, e.g. HEVC/AC3/DTS in MKV). Try an MP4/MKV with H.264 + AAC.';
+            : 'This phone could not play the saved video (error ' + er.code + '). Codec likely unsupported (HEVC/AC3/DTS in MKV). Use H.264 + AAC.');
         return;
     }
     const why = er.code === 4 ? 'this phone cannot play the video/audio codec inside this file (try MP4 H.264 + AAC, or an MKV with H.264 + AAC)'
