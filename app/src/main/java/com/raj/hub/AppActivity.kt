@@ -5,10 +5,6 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -38,6 +34,8 @@ import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.Toast
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -48,6 +46,10 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
@@ -62,6 +64,81 @@ class AppActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_ID = "app_id"
+
+        // Bridges the page's HTML video element to a native Media3/ExoPlayer surface.
+        // The HTML video remains in the layout, but its rendering is hidden; JS events and
+        // currentTime are mirrored so Sentence Repeater logic continues to work.
+        private const val NATIVE_VIDEO_HOOK_JS = """
+(function () {
+  if (window.__rajNativeVideoHook) return;
+  window.__rajNativeVideoHook = true;
+  var state = { time: 0, duration: NaN, paused: true, rate: 1 };
+  var lastVideo = null;
+  function v() { return document.querySelector('video'); }
+  function tellLayout() {
+    var x = v();
+    if (!x || !window.RajBridge || !RajBridge.nativeVideoLayout) return;
+    var r = x.getBoundingClientRect();
+    if (r.width > 4 && r.height > 4) RajBridge.nativeVideoLayout(r.left, r.top, r.width, r.height);
+  }
+  function attach(x) {
+    if (!x || x.__rajNativeAttached) return;
+    x.__rajNativeAttached = true;
+    lastVideo = x;
+    x.style.visibility = 'hidden';
+    x.style.pointerEvents = 'none';
+    ['play','pause','seeking','ratechange'].forEach(function(ev) {
+      x.addEventListener(ev, function() {
+        if (ev === 'play' && window.RajBridge.nativeVideoPlay) RajBridge.nativeVideoPlay();
+        if (ev === 'pause' && window.RajBridge.nativeVideoPause) RajBridge.nativeVideoPause();
+        if (ev === 'seeking' && window.RajBridge.nativeVideoSeek) RajBridge.nativeVideoSeek(Number(x.currentTime) || 0);
+        if (ev === 'ratechange' && window.RajBridge.nativeVideoRate) RajBridge.nativeVideoRate(Number(x.playbackRate) || 1);
+      }, true);
+    });
+    x.addEventListener('ended', function(){
+      if (window.RajBridge.nativeVideoEnded) RajBridge.nativeVideoEnded();
+    }, true);
+    // The HTML element is intentionally not the decoder anymore. Stop WebView codec
+    // errors from reaching the app's old error UI while Media3 handles the real file.
+    x.addEventListener('error', function(e){ e.preventDefault(); e.stopImmediatePropagation(); }, true);
+    tellLayout();
+  }
+  var proto = HTMLMediaElement.prototype;
+  if (!proto.__rajNativePatched) {
+    var originalPlay = proto.play;
+    var originalPause = proto.pause;
+    proto.play = function() {
+      if (this.tagName === 'VIDEO') { attach(this); if (window.RajBridge.nativeVideoPlay) RajBridge.nativeVideoPlay(); return Promise.resolve(); }
+      return originalPlay.apply(this, arguments);
+    };
+    proto.pause = function() {
+      if (this.tagName === 'VIDEO') { attach(this); if (window.RajBridge.nativeVideoPause) RajBridge.nativeVideoPause(); return; }
+      return originalPause.apply(this, arguments);
+    };
+    proto.__rajNativePatched = true;
+  }
+  try {
+    Object.defineProperty(proto, 'currentTime', { configurable: true, get: function(){ return this.tagName === 'VIDEO' ? state.time : 0; }, set: function(t){ if (this.tagName === 'VIDEO' && window.RajBridge.nativeVideoSeek) RajBridge.nativeVideoSeek(Number(t) || 0); } });
+  } catch (_) {}
+  try {
+    Object.defineProperty(proto, 'duration', { configurable: true, get: function(){ return this.tagName === 'VIDEO' ? state.duration : NaN; } });
+  } catch (_) {}
+  try {
+    Object.defineProperty(proto, 'paused', { configurable: true, get: function(){ return this.tagName === 'VIDEO' ? state.paused : true; } });
+  } catch (_) {}
+  var mo = new MutationObserver(function(){ var x=v(); if(x) attach(x); tellLayout(); });
+  mo.observe(document.documentElement || document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['src','style','class']});
+  window.addEventListener('resize', tellLayout);
+  window.addEventListener('scroll', tellLayout, true);
+  window.__rajNativeVideoUpdate = function(t,d,p,r){
+    state.time = Number(t) || 0; state.duration = Number(d); state.paused = !!p; state.rate = Number(r) || 1;
+    var x=v(); if(!x) return;
+    ['loadedmetadata','durationchange','timeupdate'].forEach(function(ev){ try{x.dispatchEvent(new Event(ev));}catch(_){}});
+    try{x.dispatchEvent(new Event(state.paused ? 'pause' : 'play'));}catch(_){}
+  };
+  setInterval(function(){ var x=v(); if(x){ attach(x); tellLayout(); } }, 1000);
+})();
+"""
 
         // Lets a page save files it creates (backups, PDFs) to Downloads. Android's WebView cannot do this alone.
         private const val DOWNLOAD_HOOK_JS = """
@@ -109,6 +186,10 @@ class AppActivity : AppCompatActivity() {
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private var lastBack = 0L
     private var ready = false
+    private var nativePlayer: ExoPlayer? = null
+    private var nativePlayerView: PlayerView? = null
+    private val nativeHandler = Handler(Looper.getMainLooper())
+    private var nativeVideoAttached = false
 
     private val chooser = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val cb = fileCallback
@@ -116,7 +197,7 @@ class AppActivity : AppCompatActivity() {
         cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
     }
 
-    // ==== ANCHOR: remembered video (persist URI when possible; private fallback otherwise) ====
+    // ==== ANCHOR: remembered video (native Media3 playback; no MKV conversion) ====
     private val videoPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val uri = r.data?.data
         if (r.resultCode != RESULT_OK || uri == null) return@registerForActivityResult
@@ -124,40 +205,6 @@ class AppActivity : AppCompatActivity() {
         val info = readVideoInfo(uri)
         val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
         val key = app.id
-
-        // MKV is a container that Android WebView's HTML video element does not
-        // reliably play. Convert the container to MP4 without re-encoding so a
-        // 3 GB H.264/AAC MKV keeps the same quality.
-        if (info.first.lowercase().endsWith(".mkv")) {
-            deletePrivateVideo(key)
-            runOnUiThread {
-                Toast.makeText(this, "Preparing MKV for smooth playback… This may take a while for a 3 GB file.", Toast.LENGTH_LONG).show()
-            }
-            Bg.run {
-                try {
-                    val out = remuxMkvToMp4(uri, key, info.first)
-                    sp.edit()
-                        .remove("vid_uri_$key")
-                        .putString("vid_path_$key", out.absolutePath)
-                        .putString("vid_name_$key", out.name)
-                        .putLong("vid_size_$key", out.length())
-                        .putLong("vid_stamp_$key", System.currentTimeMillis())
-                        .apply()
-                    runOnUiThread {
-                        Toast.makeText(this, "MKV ready. Original quality preserved; video will stay after reopening AppCluster.", Toast.LENGTH_LONG).show()
-                        sendSavedVideoToPage(false)
-                    }
-                } catch (e: Exception) {
-                    Log.e("RajHubVideo", "MKV to MP4 remux failed", e)
-                    runOnUiThread {
-                        Toast.makeText(this, "This MKV cannot be prepared automatically (${e.message ?: "unsupported codec/container"}). Use MP4 H.264 + AAC.", Toast.LENGTH_LONG).show()
-                        sendSavedVideoToPage(false)
-                    }
-                }
-            }
-            return@registerForActivityResult
-        }
-
         var persisted = false
         try {
             val flags = (r.data?.flags ?: 0) and Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -166,22 +213,18 @@ class AppActivity : AppCompatActivity() {
                 if (flags != 0) flags else Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
             persisted = contentResolver.persistedUriPermissions.any { it.uri == uri && (it.isReadPermission || it.isWritePermission) }
-        } catch (e: Exception) {
-            persisted = false
-        }
+        } catch (_: Exception) { persisted = false }
 
         deletePrivateVideo(key)
         if (persisted) {
-            sp.edit()
-                .putString("vid_uri_$key", uri.toString())
-                .remove("vid_path_$key")
-                .putString("vid_name_$key", info.first)
-                .putLong("vid_size_$key", info.second)
-                .putLong("vid_stamp_$key", System.currentTimeMillis())
-                .apply()
+            sp.edit().putString("vid_uri_$key", uri.toString()).remove("vid_path_$key")
+                .putString("vid_name_$key", info.first).putLong("vid_size_$key", info.second)
+                .putLong("vid_stamp_$key", System.currentTimeMillis()).apply()
+            Toast.makeText(this, "Video remembered. Playing original file directly.", Toast.LENGTH_SHORT).show()
+            loadNativeVideo()
             sendSavedVideoToPage(false)
         } else {
-            runOnUiThread { Toast.makeText(this, "Saving video for future launches…", Toast.LENGTH_SHORT).show() }
+            Toast.makeText(this, "Saving video for future launches…", Toast.LENGTH_SHORT).show()
             Bg.run {
                 try {
                     val dir = File(filesDir, "remembered_videos").apply { mkdirs() }
@@ -204,16 +247,27 @@ class AppActivity : AppCompatActivity() {
                         .putString("vid_name_$key", info.first).putLong("vid_size_$key", if (info.second > 0) info.second else dst.length())
                         .putLong("vid_stamp_$key", System.currentTimeMillis()).apply()
                     runOnUiThread {
-                        Toast.makeText(this, "Video saved. It will stay available after reopening AppCluster.", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "Video saved. Original MKV will play directly after reopening.", Toast.LENGTH_LONG).show()
+                        loadNativeVideo()
                         sendSavedVideoToPage(false)
                     }
                 } catch (e: Exception) {
                     Log.e("RajHubVideo", "Private video copy failed", e)
-                    runOnUiThread { Toast.makeText(this, "Could not save video for next launch: ${e.message ?: "unknown error"}", Toast.LENGTH_LONG).show() }
-                    sendSavedVideoToPage(false)
+                    runOnUiThread { Toast.makeText(this, "Could not save video: ${e.message ?: "unknown error"}", Toast.LENGTH_LONG).show() }
                 }
             }
         }
+    }
+
+    private fun savedVideoUri(): Uri? {
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        val path = sp.getString("vid_path_${app.id}", null)
+        if (!path.isNullOrBlank()) {
+            val f = File(path)
+            if (f.isFile && f.canRead()) return Uri.fromFile(f)
+        }
+        val uri = sp.getString("vid_uri_${app.id}", null)
+        return uri?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
     }
 
     private fun sendSavedVideoToPage(restored: Boolean) {
@@ -272,82 +326,73 @@ class AppActivity : AppCompatActivity() {
     }
 
 
-    /**
-     * Android WebView's HTML <video> support is much more reliable with MP4 than MKV.
-     * For MKV files we remux the existing video/audio tracks into MP4 without decoding
-     * or re-encoding. This keeps the original quality and avoids loading the 3 GB file
-     * into RAM. If the codecs themselves are unsupported, remuxing cannot fix that.
-     */
-    private fun remuxMkvToMp4(uri: Uri, appId: String, originalName: String): File {
-        val dir = File(filesDir, "remembered_videos").apply { mkdirs() }
-        val safeBase = originalName.substringBeforeLast('.', originalName.ifBlank { "video" })
-            .replace(Regex("[^A-Za-z0-9._-]"), "_")
-            .ifBlank { "video" }
-        val out = File(dir, "${appId}_${System.currentTimeMillis()}_${safeBase}.mp4")
-        val extractor = MediaExtractor()
-        var muxer: MediaMuxer? = null
-        var sourcePfd: ParcelFileDescriptor? = null
-        val trackMap = HashMap<Int, Int>()
-        try {
-            sourcePfd = contentResolver.openFileDescriptor(uri, "r")
-                ?: throw IOException("Could not open MKV")
-            // Keep the descriptor open for the entire extraction; MediaExtractor uses it lazily.
-            extractor.setDataSource(sourcePfd!!.fileDescriptor)
-
-            var videoFormat: MediaFormat? = null
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
-                if (mime.startsWith("video/") || mime.startsWith("audio/")) {
-                    if (mime.startsWith("video/") && videoFormat == null) videoFormat = format
-                    if (muxer == null) muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                    trackMap[i] = muxer!!.addTrack(format)
+    private fun ensureNativePlayer() {
+        if (nativePlayer != null) return
+        nativePlayer = ExoPlayer.Builder(this).build().also { player ->
+            player.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(state: Int) {
+                    if (state == Player.STATE_READY) nativeVideoAttached = true
+                    if (state == Player.STATE_ENDED) web.evaluateJavascript("window.__rajNativeVideoUpdate && window.__rajNativeVideoUpdate(${player.currentPosition / 1000.0},${if (player.duration > 0) player.duration / 1000.0 else "NaN"},true,${player.playbackParameters.speed})", null)
                 }
-            }
-            if (videoFormat == null) throw IOException("MKV has no video track")
-            if (trackMap.isEmpty()) throw IOException("MKV has no playable audio/video tracks")
-
-            val rotation = try {
-                if (videoFormat!!.containsKey(MediaFormat.KEY_ROTATION)) videoFormat!!.getInteger(MediaFormat.KEY_ROTATION) else 0
-            } catch (_: Exception) { 0 }
-            if (rotation == 90 || rotation == 180 || rotation == 270) {
-                try { muxer?.setOrientationHint(rotation) } catch (_: Exception) {}
-            }
-
-            muxer?.start() ?: throw IOException("Could not create MP4")
-            for (track in trackMap.keys) extractor.selectTrack(track)
-
-            val buffer = java.nio.ByteBuffer.allocateDirect(1024 * 1024)
-            val info = MediaCodec.BufferInfo()
-            while (true) {
-                val inputTrack = extractor.sampleTrackIndex
-                if (inputTrack < 0) break
-                val outputTrack = trackMap[inputTrack]
-                if (outputTrack == null) {
-                    extractor.advance()
-                    continue
-                }
-                info.offset = 0
-                info.size = extractor.readSampleData(buffer, 0)
-                if (info.size < 0) break
-                info.presentationTimeUs = extractor.sampleTime
-                info.flags = extractor.sampleFlags
-                muxer?.writeSampleData(outputTrack, buffer, info)
-                extractor.advance()
-            }
-            muxer?.stop()
-            muxer = null
-            if (!out.isFile || out.length() == 0L) throw IOException("MP4 output is empty")
-            return out
-        } catch (e: Exception) {
-            try { muxer?.stop() } catch (_: Exception) {}
-            try { muxer?.release() } catch (_: Exception) {}
-            try { out.delete() } catch (_: Exception) {}
-            throw e
-        } finally {
-            try { extractor.release() } catch (_: Exception) {}
-            try { sourcePfd?.close() } catch (_: Exception) {}
+                override fun onIsPlayingChanged(isPlaying: Boolean) { pushNativeVideoState() }
+            })
         }
+        nativePlayerView = PlayerView(this).apply {
+            player = nativePlayer
+            useController = true
+            setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
+        }
+        root.addView(nativePlayerView, FrameLayout.LayoutParams(1, 1))
+    }
+
+    private fun loadNativeVideo() {
+        runOnUiThread {
+            ensureNativePlayer()
+            val uri = savedVideoUri()
+            if (uri == null) { nativePlayerView?.visibility = View.GONE; return@runOnUiThread }
+            val item = MediaItem.Builder().setUri(uri).build()
+            nativePlayer?.setMediaItem(item)
+            nativePlayer?.prepare()
+            nativePlayer?.playWhenReady = false
+            nativePlayerView?.visibility = View.VISIBLE
+            pushNativeVideoState()
+        }
+    }
+
+    private fun pushNativeVideoState() {
+        val p = nativePlayer ?: return
+        if (!::web.isInitialized) return
+        val t = p.currentPosition / 1000.0
+        val d = if (p.duration > 0) p.duration / 1000.0 else "NaN"
+        val paused = !p.isPlaying
+        web.evaluateJavascript("window.__rajNativeVideoUpdate && window.__rajNativeVideoUpdate($t,$d,$paused,${p.playbackParameters.speed})", null)
+    }
+
+    private fun startNativeTicker() {
+        nativeHandler.removeCallbacksAndMessages(null)
+        nativeHandler.post(object : Runnable {
+            override fun run() {
+                if (!isFinishing && !isDestroyed) {
+                    pushNativeVideoState()
+                    nativeHandler.postDelayed(this, 250)
+                }
+            }
+        })
+    }
+
+    private fun layoutNativeVideo(x: Float, y: Float, w: Float, h: Float) {
+        val pv = nativePlayerView ?: return
+        val density = resources.displayMetrics.density
+        val left = (x * density).toInt().coerceAtLeast(0)
+        val top = (y * density).toInt().coerceAtLeast(0)
+        val width = (w * density).toInt().coerceAtLeast(1)
+        val height = (h * density).toInt().coerceAtLeast(1)
+        val lp = (pv.layoutParams as FrameLayout.LayoutParams)
+        lp.leftMargin = left; lp.topMargin = top; lp.width = width; lp.height = height
+        pv.layoutParams = lp
+        pv.visibility = if (savedVideoUri() != null) View.VISIBLE else View.GONE
     }
 
     /** JSON for the remembered video, or "" when there is none or it is no longer readable. */
@@ -624,8 +669,13 @@ class AppActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 view?.evaluateJavascript(DOWNLOAD_HOOK_JS, null)
-                // Restore the last selected video every time the web app starts/reloads.
-                view?.postDelayed({ sendSavedVideoToPage(true) }, 120)
+                view?.evaluateJavascript(NATIVE_VIDEO_HOOK_JS, null)
+                // Restore and play the original saved file through native Media3; no MKV conversion.
+                view?.postDelayed({
+                    loadNativeVideo()
+                    sendSavedVideoToPage(true)
+                }, 180)
+                startNativeTicker()
             }
 
             // A very big video can make Android kill the page's render process. Without this the whole app crashes.
@@ -878,10 +928,34 @@ class AppActivity : AppCompatActivity() {
             val uri = sp.getString("vid_uri_${app.id}", null)?.let { Uri.parse(it) }
             try { if (uri != null) contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
             deletePrivateVideo(app.id)
+            nativePlayer?.stop()
+            nativePlayerView?.visibility = View.GONE
             sp.edit()
                 .remove("vid_uri_${app.id}").remove("vid_name_${app.id}")
                 .remove("vid_size_${app.id}").remove("vid_stamp_${app.id}").apply()
         }
+
+        @JavascriptInterface
+        fun nativeVideoLayout(x: Float, y: Float, width: Float, height: Float) {
+            runOnUiThread { layoutNativeVideo(x, y, width, height) }
+        }
+
+        @JavascriptInterface
+        fun nativeVideoPlay() { runOnUiThread { nativePlayer?.play() } }
+
+        @JavascriptInterface
+        fun nativeVideoPause() { runOnUiThread { nativePlayer?.pause() } }
+
+        @JavascriptInterface
+        fun nativeVideoSeek(seconds: Double) {
+            runOnUiThread { nativePlayer?.seekTo((seconds.coerceAtLeast(0.0) * 1000.0).toLong()) }
+        }
+
+        @JavascriptInterface
+        fun nativeVideoRate(rate: Double) { runOnUiThread { nativePlayer?.setPlaybackSpeed(rate.toFloat().coerceIn(0.25f, 4f)) } }
+
+        @JavascriptInterface
+        fun nativeVideoEnded() { runOnUiThread { nativePlayer?.seekTo(0); nativePlayer?.pause() } }
 
         @JavascriptInterface
         fun notify(title: String, text: String) {
@@ -929,6 +1003,9 @@ class AppActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        nativeHandler.removeCallbacksAndMessages(null)
+        nativePlayer?.release()
+        nativePlayer = null
         if (ready) {
             root.removeAllViews()
             web.destroy()
