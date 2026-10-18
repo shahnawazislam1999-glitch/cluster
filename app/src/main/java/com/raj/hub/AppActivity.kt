@@ -9,8 +9,10 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.os.Message
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
@@ -43,7 +45,10 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
 import java.io.ByteArrayInputStream
+import java.io.FileInputStream
 import java.io.IOException
+import java.io.InputStream
+import org.json.JSONObject
 
 /** Runs one saved web app full screen. Press Back twice quickly to return to the lobby. */
 class AppActivity : AppCompatActivity() {
@@ -102,6 +107,146 @@ class AppActivity : AppCompatActivity() {
         val cb = fileCallback
         fileCallback = null
         cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
+    }
+
+    // ==== ANCHOR: remembered video (big MKV is streamed from the phone, never copied) ====
+    private val videoPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val uri = r.data?.data
+        if (r.resultCode != RESULT_OK || uri == null) return@registerForActivityResult
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: Exception) {
+            // some providers do not allow keeping access; the video still plays this session
+        }
+        val info = readVideoInfo(uri)
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        sp.edit()
+            .putString("vid_uri_" + app.id, uri.toString())
+            .putString("vid_name_" + app.id, info.first)
+            .putLong("vid_size_" + app.id, info.second)
+            .putLong("vid_stamp_" + app.id, System.currentTimeMillis())
+            .apply()
+        val json = savedVideoJson()
+        if (json.isNotEmpty()) web.evaluateJavascript("window.__onNativeVideo && window.__onNativeVideo($json)", null)
+    }
+
+    private fun readVideoInfo(uri: Uri): Pair<String, Long> {
+        var name = "video"
+        var size = -1L
+        try {
+            contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (ni >= 0) name = c.getString(ni) ?: name
+                    val si = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                }
+            }
+        } catch (e: Exception) {
+            // keep defaults
+        }
+        if (size < 0) {
+            try {
+                contentResolver.openFileDescriptor(uri, "r")?.use { size = it.statSize }
+            } catch (e: Exception) {
+                // keep -1
+            }
+        }
+        return Pair(name, size)
+    }
+
+    /** JSON for the remembered video, or "" when there is none (or the file can no longer be opened). */
+    private fun savedVideoJson(): String {
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        val uriStr = sp.getString("vid_uri_" + app.id, null) ?: return ""
+        return try {
+            val pfd = contentResolver.openFileDescriptor(Uri.parse(uriStr), "r")
+            if (pfd == null) {
+                ""
+            } else {
+                pfd.close()
+                val o = JSONObject()
+                o.put("name", sp.getString("vid_name_" + app.id, "video") ?: "video")
+                o.put("size", sp.getLong("vid_size_" + app.id, 0L))
+                o.put("stamp", sp.getLong("vid_stamp_" + app.id, 0L))
+                o.toString()
+            }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun videoMime(name: String): String {
+        val n = name.lowercase()
+        return when {
+            n.endsWith(".mkv") -> "video/x-matroska"
+            n.endsWith(".webm") -> "video/webm"
+            n.endsWith(".mov") -> "video/quicktime"
+            n.endsWith(".avi") -> "video/x-msvideo"
+            else -> "video/mp4"
+        }
+    }
+
+    private fun notFound(): WebResourceResponse =
+        WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", HashMap<String, String>(), ByteArrayInputStream(ByteArray(0)))
+
+    /** Streams the remembered video to the page with HTTP Range support so seeking works on multi-GB files. */
+    private fun serveVideo(req: WebResourceRequest): WebResourceResponse {
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        val uriStr = sp.getString("vid_uri_" + app.id, null) ?: return notFound()
+        return try {
+            val pfd = contentResolver.openFileDescriptor(Uri.parse(uriStr), "r") ?: return notFound()
+            var total = pfd.statSize
+            if (total <= 0) total = sp.getLong("vid_size_" + app.id, 0L)
+            if (total <= 0) {
+                pfd.close()
+                return notFound()
+            }
+            var start = 0L
+            var end = total - 1
+            var partial = false
+            val range = req.requestHeaders["Range"] ?: req.requestHeaders["range"]
+            if (range != null && range.startsWith("bytes=")) {
+                val spec = range.substring(6).split(",")[0].trim()
+                val dash = spec.indexOf('-')
+                if (dash >= 0) {
+                    val a = spec.substring(0, dash)
+                    val b = spec.substring(dash + 1)
+                    if (a.isEmpty()) {
+                        val n = b.toLongOrNull() ?: 0L
+                        start = maxOf(0L, total - n)
+                    } else {
+                        start = a.toLongOrNull() ?: 0L
+                        if (b.isNotEmpty()) end = minOf(end, b.toLongOrNull() ?: end)
+                    }
+                    partial = true
+                }
+            }
+            if (start < 0 || start > end || start >= total) {
+                pfd.close()
+                val h = HashMap<String, String>()
+                h["Content-Range"] = "bytes */$total"
+                return WebResourceResponse("text/plain", "UTF-8", 416, "Range Not Satisfiable", h, ByteArrayInputStream(ByteArray(0)))
+            }
+            val fis = FileInputStream(pfd.fileDescriptor)
+            fis.channel.position(start)
+            val length = end - start + 1
+            val headers = HashMap<String, String>()
+            headers["Accept-Ranges"] = "bytes"
+            headers["Content-Length"] = length.toString()
+            headers["Access-Control-Allow-Origin"] = "*"
+            if (partial) headers["Content-Range"] = "bytes $start-$end/$total"
+            val mime = videoMime(sp.getString("vid_name_" + app.id, "") ?: "")
+            WebResourceResponse(
+                mime, null,
+                if (partial) 206 else 200,
+                if (partial) "Partial Content" else "OK",
+                headers,
+                RangeStream(pfd, fis, length)
+            )
+        } catch (e: Exception) {
+            notFound()
+        }
     }
 
     // ==== ANCHOR: web page camera / microphone / location permission requests ====
@@ -255,6 +400,7 @@ class AppActivity : AppCompatActivity() {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                 val req = request ?: return null
                 val u = req.url
+                if (u.host == app.host && u.path == "/__video__") return serveVideo(req)
                 val local = loader.shouldInterceptRequest(u)
                 if (local != null) return local
                 if (u.host == app.host) {
@@ -501,6 +647,33 @@ class AppActivity : AppCompatActivity() {
 
     /** Called from the page's JavaScript: save a file into Downloads/AppCluster, or show a notification. */
     private inner class Bridge {
+        /** Opens Android's file picker and remembers the chosen video between app launches. */
+        @JavascriptInterface
+        fun pickVideo() {
+            runOnUiThread {
+                try {
+                    val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                    i.addCategory(Intent.CATEGORY_OPENABLE)
+                    i.type = "*/*"
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                    videoPicker.launch(i)
+                } catch (e: Exception) {
+                    Toast.makeText(this@AppActivity, "Could not open the file picker", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
+        /** JSON of the remembered video, or an empty string. */
+        @JavascriptInterface
+        fun getSavedVideo(): String = savedVideoJson()
+
+        @JavascriptInterface
+        fun forgetVideo() {
+            getSharedPreferences("rajhub", MODE_PRIVATE).edit()
+                .remove("vid_uri_" + app.id).remove("vid_name_" + app.id)
+                .remove("vid_size_" + app.id).remove("vid_stamp_" + app.id).apply()
+        }
+
         @JavascriptInterface
         fun notify(title: String, text: String) {
             Notifier.show(this@AppActivity, title, text)
@@ -552,5 +725,33 @@ class AppActivity : AppCompatActivity() {
             web.destroy()
         }
         super.onDestroy()
+    }
+}
+
+/** Reads at most [remaining] bytes from an already-positioned file; closes the descriptor when done. */
+private class RangeStream(
+    private val pfd: ParcelFileDescriptor,
+    private val fis: FileInputStream,
+    private var remaining: Long
+) : InputStream() {
+    override fun read(): Int {
+        if (remaining <= 0) return -1
+        val r = fis.read()
+        if (r >= 0) remaining--
+        return r
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (remaining <= 0) return -1
+        val n = fis.read(b, off, minOf(len.toLong(), remaining).toInt())
+        if (n > 0) remaining -= n.toLong()
+        return n
+    }
+
+    override fun available(): Int = minOf(remaining, Int.MAX_VALUE.toLong()).toInt()
+
+    override fun close() {
+        try { fis.close() } catch (e: Exception) { }
+        try { pfd.close() } catch (e: Exception) { }
     }
 }
