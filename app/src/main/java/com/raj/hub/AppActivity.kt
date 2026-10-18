@@ -47,6 +47,8 @@ import androidx.webkit.WebViewAssetLoader
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.BufferedInputStream
 import java.io.IOException
 import java.io.InputStream
 import org.json.JSONObject
@@ -56,7 +58,6 @@ class AppActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_ID = "app_id"
-        private const val MAX_OPEN_RANGE = 64L * 1024 * 1024
 
         // Lets a page save files it creates (backups, PDFs) to Downloads. Android's WebView cannot do this alone.
         private const val DOWNLOAD_HOOK_JS = """
@@ -111,120 +112,110 @@ class AppActivity : AppCompatActivity() {
         cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
     }
 
-    // ==== ANCHOR: remembered video (big MKV is streamed from the phone; a private copy is kept if Android will not remember the file) ====
-    private val prefs get() = getSharedPreferences("rajhub", MODE_PRIVATE)
-    private fun copyFile() = File(filesDir, "video/" + app.id + ".bin")
-
+    // ==== ANCHOR: remembered video (persist URI when possible; private fallback otherwise) ====
     private val videoPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val uri = r.data?.data
         if (r.resultCode != RESULT_OK || uri == null) return@registerForActivityResult
-        onVideoPicked(uri)
-    }
-
-    private fun onVideoPicked(uri: Uri) {
-        // 1) ask Android to remember this file for good
-        var persisted = false
-        try {
-            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        } catch (e: Exception) {
-            Log.w("RajHubVideo", "takePersistableUriPermission failed: $e")
-        }
-        try {
-            persisted = contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
-        } catch (e: Exception) { }
-
-        // 2) forget the previous video's permission and private copy
-        val old = prefs.getString("vid_uri_" + app.id, null)
-        if (old != null && old != uri.toString()) {
-            try { contentResolver.releasePersistableUriPermission(Uri.parse(old), Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) { }
-        }
 
         val info = readVideoInfo(uri)
-        val canOpen = try {
-            contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize != 0L } ?: false
-        } catch (e: Exception) { false }
-        if (!canOpen) {
-            Toast.makeText(this, "Could not open this file. Please choose it from Files / Downloads.", Toast.LENGTH_LONG).show()
-            return
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        val key = app.id
+        var persisted = false
+        try {
+            val flags = (r.data?.flags ?: 0) and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            contentResolver.takePersistableUriPermission(
+                uri,
+                if (flags != 0) flags else Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+            persisted = contentResolver.persistedUriPermissions.any { it.uri == uri && (it.isReadPermission || it.isWritePermission) }
+        } catch (e: Exception) {
+            persisted = false
         }
+
+        // Remove any previous private fallback first.
+        deletePrivateVideo(key)
 
         if (persisted) {
-            try { copyFile().delete() } catch (e: Exception) { }
-            saveVideoPrefs(uri.toString(), info.first, info.second, "uri")
-            pushVideoToPage(false)
+            sp.edit()
+                .putString("vid_uri_$key", uri.toString())
+                .remove("vid_path_$key")
+                .putString("vid_name_$key", info.first)
+                .putLong("vid_size_$key", info.second)
+                .putLong("vid_stamp_$key", System.currentTimeMillis())
+                .apply()
+            sendSavedVideoToPage(false)
         } else {
-            // Android will not remember this file. Keep our own copy so it never disappears.
-            copyVideoIntoApp(uri, info)
-        }
-    }
-
-    private fun saveVideoPrefs(uri: String, name: String, size: Long, mode: String) {
-        prefs.edit()
-            .putString("vid_uri_" + app.id, uri)
-            .putString("vid_name_" + app.id, name)
-            .putLong("vid_size_" + app.id, size)
-            .putLong("vid_stamp_" + app.id, System.currentTimeMillis())
-            .putString("vid_mode_" + app.id, mode)
-            .commit() // commit (not apply) so it is on disk even if the app is killed right now
-    }
-
-    private fun pushVideoToPage(restored: Boolean) {
-        val json = savedVideoJson()
-        if (json.isEmpty()) return
-        runOnUiThread {
-            if (ready && !isDestroyed) web.evaluateJavascript("window.__onNativeVideo && window.__onNativeVideo($json)", null)
-        }
-    }
-
-    private fun pushProgress(pct: Int, text: String) {
-        val t = JSONObject.quote(text)
-        runOnUiThread {
-            if (ready && !isDestroyed) web.evaluateJavascript("window.__onNativeVideoProgress && window.__onNativeVideoProgress($pct, $t)", null)
-        }
-    }
-
-    /** Copies the picked video into the app's private storage (once) so it stays forever. */
-    private fun copyVideoIntoApp(uri: Uri, info: Pair<String, Long>) {
-        val dest = copyFile()
-        val tmp = File(dest.parentFile, dest.name + ".part")
-        pushProgress(0, "Saving video inside the app... 0%")
-        Bg.run {
-            try {
-                dest.parentFile?.mkdirs()
-                val total = info.second
-                val input = contentResolver.openInputStream(uri) ?: throw IOException("cannot open")
-                var done = 0L
-                var lastPct = -1
-                input.use { ins ->
-                    tmp.outputStream().buffered(1 shl 20).use { out ->
-                        val buf = ByteArray(1 shl 20)
-                        while (true) {
-                            val n = ins.read(buf)
-                            if (n < 0) break
-                            out.write(buf, 0, n)
-                            done += n
-                            if (total > 0) {
-                                val pct = (done * 100 / total).toInt()
-                                if (pct != lastPct) { lastPct = pct; pushProgress(pct, "Saving video inside the app... $pct%") }
+            // Some gallery/cloud providers grant only temporary access. Copy once into
+            // the app's private storage so the selected video survives app restarts.
+            runOnUiThread { Toast.makeText(this, "Saving video for future launches…", Toast.LENGTH_SHORT).show() }
+            Bg.run {
+                try {
+                    val dir = File(filesDir, "remembered_videos").apply { mkdirs() }
+                    val safeName = (info.first.ifBlank { "video" }).replace(Regex("[^A-Za-z0-9._-]"), "_")
+                    val dst = File(dir, "${key}_${System.currentTimeMillis()}_$safeName")
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        BufferedInputStream(input, 1024 * 1024).use { bin ->
+                            FileOutputStream(dst).use { out ->
+                                val buf = ByteArray(1024 * 1024)
+                                while (true) {
+                                    val n = bin.read(buf)
+                                    if (n < 0) break
+                                    out.write(buf, 0, n)
+                                }
+                                out.fd.sync()
                             }
                         }
+                    } ?: throw IOException("Could not read selected video")
+
+                    sp.edit()
+                        .remove("vid_uri_$key")
+                        .putString("vid_path_$key", dst.absolutePath)
+                        .putString("vid_name_$key", info.first)
+                        .putLong("vid_size_$key", if (info.second > 0) info.second else dst.length())
+                        .putLong("vid_stamp_$key", System.currentTimeMillis())
+                        .apply()
+
+                    runOnUiThread {
+                        Toast.makeText(this, "Video saved. It will stay available after reopening AppCluster.", Toast.LENGTH_LONG).show()
+                        sendSavedVideoToPage(false)
                     }
+                } catch (e: Exception) {
+                    Log.e("RajHubVideo", "Private video copy failed", e)
+                    runOnUiThread { Toast.makeText(this, "Could not save video for next launch: ${e.message ?: "unknown error"}", Toast.LENGTH_LONG).show() }
+                    sendSavedVideoToPage(false)
                 }
-                if (dest.exists()) dest.delete()
-                if (!tmp.renameTo(dest)) throw IOException("rename failed")
-                saveVideoPrefs("file://" + dest.absolutePath, info.first, dest.length(), "copy")
-                pushVideoToPage(false)
-            } catch (e: Exception) {
-                Log.e("RajHubVideo", "copy failed", e)
-                try { tmp.delete() } catch (x: Exception) { }
-                runOnUiThread {
-                    Toast.makeText(this, "Not enough free space to keep the video inside the app.", Toast.LENGTH_LONG).show()
-                }
-                // still play it for this session straight from the picked file
-                saveVideoPrefs(uri.toString(), info.first, info.second, "uri")
-                pushVideoToPage(false)
             }
         }
+    }
+
+    private fun sendSavedVideoToPage(restored: Boolean) {
+        val json = savedVideoJson(restored)
+        if (json.isNotEmpty() && ::web.isInitialized) {
+            web.evaluateJavascript("window.__onNativeVideo && window.__onNativeVideo($json)", null)
+        }
+    }
+
+    private fun privateVideoFile(): File? {
+        val path = getSharedPreferences("rajhub", MODE_PRIVATE).getString("vid_path_${app.id}", null) ?: return null
+        return File(path).takeIf { it.isFile && it.canRead() }
+    }
+
+    private fun deletePrivateVideo(id: String) {
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        sp.getString("vid_path_$id", null)?.let { try { File(it).delete() } catch (_: Exception) {} }
+        sp.edit().remove("vid_path_$id").apply()
+    }
+
+    private fun openSavedVideoPfd(): ParcelFileDescriptor? {
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        val path = sp.getString("vid_path_${app.id}", null)
+        if (!path.isNullOrBlank()) {
+            val f = File(path)
+            if (f.isFile && f.canRead()) return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        }
+        val uriStr = sp.getString("vid_uri_${app.id}", null)
+        if (!uriStr.isNullOrBlank()) return contentResolver.openFileDescriptor(Uri.parse(uriStr), "r")
+        return null
     }
 
     private fun readVideoInfo(uri: Uri): Pair<String, Long> {
@@ -242,7 +233,7 @@ class AppActivity : AppCompatActivity() {
         } catch (e: Exception) {
             // keep defaults
         }
-        if (size <= 0) {
+        if (size < 0) {
             try {
                 contentResolver.openFileDescriptor(uri, "r")?.use { size = it.statSize }
             } catch (e: Exception) {
@@ -252,46 +243,34 @@ class AppActivity : AppCompatActivity() {
         return Pair(name, size)
     }
 
-    /** Opens the remembered video (private copy first, then the saved Android file). Null when it cannot be opened. */
-    private fun openSavedVideo(): ParcelFileDescriptor? {
-        val cf = copyFile()
-        if (cf.isFile && cf.length() > 0) {
-            try { return ParcelFileDescriptor.open(cf, ParcelFileDescriptor.MODE_READ_ONLY) } catch (e: Exception) { }
-        }
-        val uriStr = prefs.getString("vid_uri_" + app.id, null) ?: return null
-        if (uriStr.startsWith("file://")) return null
+    /** JSON for the remembered video, or "" when there is none or it is no longer readable. */
+    private fun savedVideoJson(restored: Boolean = true): String {
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        val path = sp.getString("vid_path_${app.id}", null)
+        val uriStr = sp.getString("vid_uri_${app.id}", null)
         return try {
-            contentResolver.openFileDescriptor(Uri.parse(uriStr), "r")
+            val pfd = openSavedVideoPfd() ?: return ""
+            val size = if (pfd.statSize > 0) pfd.statSize else sp.getLong("vid_size_${app.id}", 0L)
+            pfd.close()
+            val o = JSONObject()
+            o.put("name", sp.getString("vid_name_${app.id}", "video") ?: "video")
+            o.put("size", size)
+            o.put("stamp", sp.getLong("vid_stamp_${app.id}", 0L))
+            o.put("restored", restored)
+            o.toString()
         } catch (e: Exception) {
-            Log.w("RajHubVideo", "cannot open saved video: $e")
-            null
+            // A provider URI may have expired. If a private copy is missing too, forget it.
+            if (!path.isNullOrBlank() && !File(path).exists()) {
+                sp.edit().remove("vid_path_${app.id}").apply()
+            }
+            if (!uriStr.isNullOrBlank()) {
+                try {
+                    val u = Uri.parse(uriStr)
+                    contentResolver.releasePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (_: Exception) {}
+            }
+            ""
         }
-    }
-
-    /**
-     * JSON for the remembered video, or "" when nothing was ever saved.
-     * If a video was saved but its file can no longer be opened the JSON has "missing":true,
-     * so the page can say so instead of silently showing nothing (and we never forget the choice by accident).
-     */
-    private fun savedVideoJson(): String {
-        val sp = prefs
-        if (sp.getString("vid_uri_" + app.id, null) == null) return ""
-        val o = JSONObject()
-        o.put("name", sp.getString("vid_name_" + app.id, "video") ?: "video")
-        o.put("stamp", sp.getLong("vid_stamp_" + app.id, 0L))
-        o.put("mode", sp.getString("vid_mode_" + app.id, "uri") ?: "uri")
-        val pfd = openSavedVideo()
-        if (pfd == null) {
-            o.put("size", sp.getLong("vid_size_" + app.id, 0L))
-            o.put("missing", true)
-        } else {
-            var sz = 0L
-            try { sz = pfd.statSize } catch (e: Exception) { }
-            try { pfd.close() } catch (e: Exception) { }
-            o.put("size", if (sz > 0) sz else sp.getLong("vid_size_" + app.id, 0L))
-            o.put("missing", false)
-        }
-        return o.toString()
     }
 
     private fun videoMime(name: String): String {
@@ -301,8 +280,6 @@ class AppActivity : AppCompatActivity() {
             n.endsWith(".webm") -> "video/webm"
             n.endsWith(".mov") -> "video/quicktime"
             n.endsWith(".avi") -> "video/x-msvideo"
-            n.endsWith(".3gp") -> "video/3gpp"
-            n.endsWith(".ts") -> "video/mp2t"
             else -> "video/mp4"
         }
     }
@@ -312,10 +289,9 @@ class AppActivity : AppCompatActivity() {
 
     /** Streams the remembered video to the page with HTTP Range support so seeking works on multi-GB files. */
     private fun serveVideo(req: WebResourceRequest): WebResourceResponse {
-        val sp = prefs
-        var pfd: ParcelFileDescriptor? = null
+        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
         return try {
-            pfd = openSavedVideo() ?: return notFound()
+            val pfd = openSavedVideoPfd() ?: return notFound()
             var total = pfd.statSize
             if (total <= 0) total = sp.getLong("vid_size_" + app.id, 0L)
             if (total <= 0) {
@@ -337,12 +313,7 @@ class AppActivity : AppCompatActivity() {
                         start = maxOf(0L, total - n)
                     } else {
                         start = a.toLongOrNull() ?: 0L
-                        if (b.isNotEmpty()) {
-                            end = minOf(end, b.toLongOrNull() ?: end)
-                        } else if (end - start + 1 > MAX_OPEN_RANGE) {
-                            // open-ended request: answer in chunks, the player simply asks for the next one
-                            end = start + MAX_OPEN_RANGE - 1
-                        }
+                        if (b.isNotEmpty()) end = minOf(end, b.toLongOrNull() ?: end)
                     }
                     partial = true
                 }
@@ -354,23 +325,12 @@ class AppActivity : AppCompatActivity() {
                 return WebResourceResponse("text/plain", "UTF-8", 416, "Range Not Satisfiable", h, ByteArrayInputStream(ByteArray(0)))
             }
             val fis = FileInputStream(pfd.fileDescriptor)
-            try {
-                fis.channel.position(start)
-            } catch (e: Exception) {
-                // not seekable: read and throw away the bytes before [start]
-                var skip = start
-                while (skip > 0) {
-                    val k = fis.skip(skip)
-                    if (k <= 0) break
-                    skip -= k
-                }
-            }
+            fis.channel.position(start)
             val length = end - start + 1
             val headers = HashMap<String, String>()
             headers["Accept-Ranges"] = "bytes"
             headers["Content-Length"] = length.toString()
             headers["Access-Control-Allow-Origin"] = "*"
-            headers["Cache-Control"] = "no-store"
             if (partial) headers["Content-Range"] = "bytes $start-$end/$total"
             val mime = videoMime(sp.getString("vid_name_" + app.id, "") ?: "")
             WebResourceResponse(
@@ -381,8 +341,6 @@ class AppActivity : AppCompatActivity() {
                 RangeStream(pfd, fis, length)
             )
         } catch (e: Exception) {
-            Log.w("RajHubVideo", "serveVideo failed: $e")
-            try { pfd?.close() } catch (x: Exception) { }
             notFound()
         }
     }
@@ -559,6 +517,8 @@ class AppActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 view?.evaluateJavascript(DOWNLOAD_HOOK_JS, null)
+                // Restore the last selected video every time the web app starts/reloads.
+                view?.postDelayed({ sendSavedVideoToPage(true) }, 120)
             }
 
             // A very big video can make Android kill the page's render process. Without this the whole app crashes.
@@ -793,7 +753,6 @@ class AppActivity : AppCompatActivity() {
                     val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
                     i.addCategory(Intent.CATEGORY_OPENABLE)
                     i.type = "*/*"
-                    i.putExtra("android.content.extra.SHOW_ADVANCED", true)
                     i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
                     videoPicker.launch(i)
                 } catch (e: Exception) {
@@ -808,14 +767,13 @@ class AppActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun forgetVideo() {
-            val old = prefs.getString("vid_uri_" + app.id, null)
-            if (old != null && !old.startsWith("file://")) {
-                try { contentResolver.releasePersistableUriPermission(Uri.parse(old), Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) { }
-            }
-            try { copyFile().delete() } catch (e: Exception) { }
-            prefs.edit()
-                .remove("vid_uri_" + app.id).remove("vid_name_" + app.id)
-                .remove("vid_size_" + app.id).remove("vid_stamp_" + app.id).remove("vid_mode_" + app.id).commit()
+            val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+            val uri = sp.getString("vid_uri_${app.id}", null)?.let { Uri.parse(it) }
+            try { if (uri != null) contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+            deletePrivateVideo(app.id)
+            sp.edit()
+                .remove("vid_uri_${app.id}").remove("vid_name_${app.id}")
+                .remove("vid_size_${app.id}").remove("vid_stamp_${app.id}").apply()
         }
 
         @JavascriptInterface
@@ -872,47 +830,29 @@ class AppActivity : AppCompatActivity() {
     }
 }
 
-/** Reads at most [remaining] bytes from an already-positioned file (in big 512 KB chunks, so 4 GB videos load fast); closes the descriptor when done. */
+/** Reads at most [remaining] bytes from an already-positioned file; closes the descriptor when done. */
 private class RangeStream(
     private val pfd: ParcelFileDescriptor,
     private val fis: FileInputStream,
     private var remaining: Long
 ) : InputStream() {
-    private val buf = ByteArray(512 * 1024)
-    private var pos = 0
-    private var lim = 0
-    private var closed = false
-
-    private fun fill(): Boolean {
-        if (remaining <= 0 || closed) return false
-        val want = minOf(buf.size.toLong(), remaining).toInt()
-        val n = try { fis.read(buf, 0, want) } catch (e: IOException) { -1 }
-        if (n <= 0) { remaining = 0; return false }
-        pos = 0
-        lim = n
-        remaining -= n.toLong()
-        return true
-    }
-
     override fun read(): Int {
-        if (pos >= lim && !fill()) return -1
-        return buf[pos++].toInt() and 0xFF
+        if (remaining <= 0) return -1
+        val r = fis.read()
+        if (r >= 0) remaining--
+        return r
     }
 
     override fun read(b: ByteArray, off: Int, len: Int): Int {
-        if (len == 0) return 0
-        if (pos >= lim && !fill()) return -1
-        val n = minOf(len, lim - pos)
-        System.arraycopy(buf, pos, b, off, n)
-        pos += n
+        if (remaining <= 0) return -1
+        val n = fis.read(b, off, minOf(len.toLong(), remaining).toInt())
+        if (n > 0) remaining -= n.toLong()
         return n
     }
 
-    override fun available(): Int = (lim - pos) + minOf(remaining, 1L shl 20).toInt()
+    override fun available(): Int = minOf(remaining, Int.MAX_VALUE.toLong()).toInt()
 
     override fun close() {
-        if (closed) return
-        closed = true
         try { fis.close() } catch (e: Exception) { }
         try { pfd.close() } catch (e: Exception) { }
     }

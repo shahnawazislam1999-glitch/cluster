@@ -76,11 +76,3 @@ Host a copy of `apps.json` somewhere online (for example in a GitHub repo, using
 
 - The signing key `app/raj-hub.jks` is included on purpose so every build is signed the same way. This is fine for a personal app. Do not use it for the Play Store.
 - Each app is served from its own private address inside the phone, so their saved data never mixes.
-
-## Big video (4 GB MKV) is remembered forever (SHADOWit)
-
-- Tap the video button once and pick the file. The app keeps Android's permission to that file and streams it with seek support.
-- If Android refuses to remember the file (some pickers), the app automatically keeps its own copy (needs free space) and shows the progress.
-- SHADOWit's `index.html` is **bundled inside the APK** (`app/src/main/assets/sites/shadowit/index.html`) and is never replaced by the older GitHub copy.
-  To change the page: replace that file, push, let GitHub build the new APK and install it over the old one.
-  To go back to online updates, delete `"bundled": true` for shadowit in `assets/apps.json`.
