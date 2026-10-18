@@ -11,7 +11,8 @@
       "externals": [
         "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;800&family=Playfair+Display:wght@800&display=swap"
       ],
-      "accent": "#FF8A4C"
+      "accent": "#FF8A4C",
+      "bundled": true
     },
     {
       "id": "mocktest",

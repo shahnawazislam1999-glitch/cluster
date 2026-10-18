@@ -31,7 +31,9 @@ data class AppInfo(
     val entry: String,
     val files: List<String>,
     val externals: List<String>,
-    val accent: Int
+    val accent: Int,
+    /** true = index.html ships inside the APK (assets/sites/<id>/) and is never replaced by the online copy */
+    val bundled: Boolean = false
 ) {
     /** Every app gets its own private web address, so their saved data never mixes. */
     val host: String get() = "$id.rajhub.local"
@@ -252,7 +254,8 @@ object AppRegistry {
                     entry = entry,
                     files = files,
                     externals = ext,
-                    accent = accent
+                    accent = accent,
+                    bundled = o.optBoolean("bundled", false)
                 )
             )
         }
@@ -266,7 +269,39 @@ class AppStore(private val ctx: Context) {
     fun siteDir(app: AppInfo) = File(ctx.filesDir, "apps/${app.id}")
     private fun extDir(app: AppInfo) = File(ctx.filesDir, "ext/${app.id}")
 
-    fun isInstalled(app: AppInfo): Boolean = File(siteDir(app), app.entry).isFile
+    fun isInstalled(app: AppInfo): Boolean {
+        ensureSeeded(app)
+        return File(siteDir(app), app.entry).isFile
+    }
+
+    /** Copies the page that ships inside the APK into the app's folder (only when it is new or changed). */
+    private fun ensureSeeded(app: AppInfo) {
+        if (!app.bundled) return
+        synchronized(seeded) {
+            if (seeded.contains(app.id)) return
+            try {
+                val bytes = ctx.assets.open("sites/${app.id}/${app.entry}").use { it.readBytes() }
+                val hash = MessageDigest.getInstance("SHA-1").digest(bytes).joinToString("") { "%02x".format(it) }
+                val sp = ctx.getSharedPreferences("rajhub", Context.MODE_PRIVATE)
+                val dest = File(siteDir(app), app.entry)
+                if (!dest.isFile || sp.getString("seed_${app.id}", "") != hash || dest.length() != bytes.size.toLong()) {
+                    dest.parentFile?.mkdirs()
+                    val tmp = File(dest.parentFile, app.entry + ".tmp")
+                    tmp.writeBytes(bytes)
+                    if (dest.exists()) dest.delete()
+                    if (!tmp.renameTo(dest)) { tmp.copyTo(dest, overwrite = true); tmp.delete() }
+                    sp.edit().putString("seed_${app.id}", hash).commit()
+                }
+                seeded.add(app.id)
+            } catch (e: Exception) {
+                // no bundled copy in this build: fall back to the online one
+            }
+        }
+    }
+
+    private companion object {
+        val seeded = HashSet<String>()
+    }
 
     fun sizeBytes(app: AppInfo): Long {
         var total = 0L
@@ -302,6 +337,8 @@ class AppStore(private val ctx: Context) {
      * Returns true if anything changed. Throws if the main files could not be downloaded.
      */
     fun sync(app: AppInfo, onProgress: (Int) -> Unit): Boolean {
+        ensureSeeded(app)
+        val files = if (app.bundled) app.files.filter { it != app.entry } else app.files
         val site = siteDir(app)
         val stage = File(ctx.filesDir, "apps/${app.id}.stage")
         val ext = extDir(app)
@@ -313,11 +350,11 @@ class AppStore(private val ctx: Context) {
         ext.mkdirs()
         site.mkdirs()
 
-        var total = app.files.size + app.externals.size
+        var total = maxOf(1, files.size + app.externals.size)
         var done = 0
         try {
             onProgress(0)
-            for (f in app.files) {
+            for (f in files) {
                 val dest = File(stage, f)
                 dest.parentFile?.mkdirs()
                 Net.download(app.baseUrl + f, dest)
@@ -358,7 +395,7 @@ class AppStore(private val ctx: Context) {
 
             // Everything downloaded: now swap into place (entry page last).
             var changed = false
-            val ordered = app.files.filter { it != app.entry } + app.entry
+            val ordered = if (app.bundled) files else files.filter { it != app.entry } + app.entry
             for (f in ordered) {
                 val s = File(stage, f)
                 val d = File(site, f)
