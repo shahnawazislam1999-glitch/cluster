@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.graphics.drawable.GradientDrawable
 import android.graphics.Paint
 import android.graphics.RenderEffect
 import android.graphics.Shader
@@ -18,13 +19,16 @@ import android.os.Looper
 import android.os.StatFs
 import android.provider.OpenableColumns
 import android.text.TextPaint
+import android.view.Gravity
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -32,6 +36,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
@@ -44,6 +49,7 @@ import androidx.media3.ui.PlayerView
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 
 /**
  * Native video player (Media3 ExoPlayer) for the web pages in this app.
@@ -95,9 +101,26 @@ class NativeVideo(
     private var fxBlurCssPx = 0f
     private var fxOldTv = false
 
+    // audio language switching (dual audio MKV, e.g. English / Hindi)
+    private var audioList: List<Tracks.Group> = emptyList()
+    private var audioPrefApplied = false
+    private val audioChip = TextView(act)
+
     init {
         panel.visibility = View.GONE
         panel.addView(tiles, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        audioChip.setTextColor(Color.WHITE)
+        audioChip.textSize = 13f
+        audioChip.setPadding(dp(12), dp(6), dp(12), dp(6))
+        val chipBg = GradientDrawable()
+        chipBg.setColor(0x99000000.toInt())
+        chipBg.cornerRadius = dp(16).toFloat()
+        audioChip.background = chipBg
+        audioChip.visibility = View.GONE
+        audioChip.setOnClickListener { showAudioDialog() }
+        val chipLp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END)
+        chipLp.setMargins(0, dp(8), dp(8), 0)
+        panel.addView(audioChip, chipLp)
         playerView.setFullscreenButtonClickListener { setFullscreen(!fullscreen) }
         playerView.subtitleView?.visibility = View.GONE
     }
@@ -204,6 +227,7 @@ class NativeVideo(
         var videoOn = false
         val audioNames = ArrayList<String>()
         val videoNames = ArrayList<String>()
+        updateAudioTracks(t)
         for (g in t.groups) {
             val mime = if (g.length > 0) (g.getTrackFormat(0).sampleMimeType ?: "") else ""
             val nice = mime.substringAfter('/').uppercase().ifEmpty { "?" }
@@ -232,6 +256,92 @@ class NativeVideo(
             emit(o)
             Toast.makeText(act, msg.toString().trim(), Toast.LENGTH_LONG).show()
         }
+    }
+
+    // ------------------------------------------------------------------ audio language
+
+    private fun langKey(code: String): String {
+        val c = code.lowercase()
+        return when {
+            c.startsWith("en") -> "en"
+            c.startsWith("hi") -> "hi"
+            else -> c.take(2)
+        }
+    }
+
+    private fun audioName(g: Tracks.Group, i: Int): String {
+        val f = g.getTrackFormat(0)
+        val code = f.language ?: ""
+        val label = f.label
+        val lang = when (langKey(code)) {
+            "en" -> "English"
+            "hi" -> "Hindi"
+            else -> if (code.isNotEmpty() && code != "und") Locale.forLanguageTag(code).getDisplayLanguage(Locale.ENGLISH).ifEmpty { code } else ""
+        }
+        return when {
+            lang.isNotEmpty() && label != null && !label.contains(lang, true) -> "$lang ($label)"
+            lang.isNotEmpty() -> lang
+            label != null -> label
+            else -> "Audio " + (i + 1)
+        }
+    }
+
+    private fun updateAudioTracks(t: Tracks) {
+        val all = t.groups.filter { it.type == C.TRACK_TYPE_AUDIO && it.length > 0 }
+        val list = all.filter { it.isSupported }
+        audioList = list
+        if (all.size > list.size && list.isNotEmpty()) {
+            Toast.makeText(act, "Another audio track in this file uses a format this phone cannot play, so it is not listed.", Toast.LENGTH_LONG).show()
+        }
+        if (list.size < 2) {
+            audioChip.visibility = View.GONE
+            return
+        }
+        if (!audioPrefApplied) {
+            audioPrefApplied = true
+            val wantLang = prefs.getString(key("aud_lang"), null)
+            var idx = -1
+            if (wantLang != null) idx = list.indexOfFirst { langKey(it.getTrackFormat(0).language ?: "") == wantLang }
+            if (idx < 0) {
+                val wantIdx = prefs.getInt(key("aud_idx"), -1)
+                if (wantIdx in list.indices && wantLang == null) idx = wantIdx
+            }
+            if (idx >= 0 && !list[idx].isSelected) {
+                selectAudio(idx, false)
+                return // the player reports the tracks again after the switch
+            }
+        }
+        val sel = list.indexOfFirst { it.isSelected }.coerceAtLeast(0)
+        audioChip.text = "🔊 " + audioName(list[sel], sel) + " ▾"
+        audioChip.visibility = View.VISIBLE
+    }
+
+    private fun selectAudio(idx: Int, remember: Boolean) {
+        val p = exo ?: return
+        val g = audioList.getOrNull(idx) ?: return
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+            .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, 0))
+            .build()
+        if (remember) {
+            prefs.edit()
+                .putString(key("aud_lang"), langKey(g.getTrackFormat(0).language ?: "").ifEmpty { "?" })
+                .putInt(key("aud_idx"), idx)
+                .apply()
+        }
+    }
+
+    private fun showAudioDialog() {
+        val list = audioList
+        if (list.size < 2 || act.isFinishing) return
+        val names = Array(list.size) { audioName(list[it], it) }
+        val cur = list.indexOfFirst { it.isSelected }.coerceAtLeast(0)
+        AlertDialog.Builder(act)
+            .setTitle("Audio")
+            .setSingleChoiceItems(names, cur) { d, which ->
+                selectAudio(which, true)
+                d.dismiss()
+            }
+            .show()
     }
 
     // ------------------------------------------------------------------ state -> page
@@ -571,6 +681,9 @@ class NativeVideo(
             loadedKey = k
             hasMedia = true
             seekPending = false
+            audioPrefApplied = false
+            audioList = emptyList()
+            audioChip.visibility = View.GONE
             videoAspect = 16f / 9f
             p.setMediaItem(MediaItem.fromUri(s.uri), startMs)
             p.playWhenReady = false
@@ -718,6 +831,7 @@ class NativeVideo(
         prefs.edit()
             .remove(key("vid_uri")).remove(key("vid_name")).remove(key("vid_size"))
             .remove(key("vid_stamp")).remove(key("vid_priv")).remove(key("vid_pos"))
+            .remove(key("aud_lang")).remove(key("aud_idx"))
             .apply()
         removePrivateExcept(null)
         applyVisibility()
