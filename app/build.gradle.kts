@@ -51,6 +51,9 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.webkit:webkit:1.11.0")
+
+    // Native video player. 1.4.1 is the newest Media3 that still builds with compileSdk 34 / AGP 8.5.2.
+    // (Media3 1.5.x needs compileSdk 35, which is what broke the GitHub build before.)
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
 }

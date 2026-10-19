@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -33,9 +34,8 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.Toast
-import android.os.Handler
-import android.os.Looper
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -46,15 +46,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
 import java.io.ByteArrayInputStream
-import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.io.BufferedInputStream
 import java.io.IOException
 import java.io.InputStream
 import org.json.JSONObject
@@ -64,81 +57,6 @@ class AppActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_ID = "app_id"
-
-        // Bridges the page's HTML video element to a native Media3/ExoPlayer surface.
-        // The HTML video remains in the layout, but its rendering is hidden; JS events and
-        // currentTime are mirrored so Sentence Repeater logic continues to work.
-        private const val NATIVE_VIDEO_HOOK_JS = """
-(function () {
-  if (window.__rajNativeVideoHook) return;
-  window.__rajNativeVideoHook = true;
-  var state = { time: 0, duration: NaN, paused: true, rate: 1 };
-  var lastVideo = null;
-  function v() { return document.querySelector('video'); }
-  function tellLayout() {
-    var x = v();
-    if (!x || !window.RajBridge || !RajBridge.nativeVideoLayout) return;
-    var r = x.getBoundingClientRect();
-    if (r.width > 4 && r.height > 4) RajBridge.nativeVideoLayout(r.left, r.top, r.width, r.height);
-  }
-  function attach(x) {
-    if (!x || x.__rajNativeAttached) return;
-    x.__rajNativeAttached = true;
-    lastVideo = x;
-    x.style.visibility = 'hidden';
-    x.style.pointerEvents = 'none';
-    ['play','pause','seeking','ratechange'].forEach(function(ev) {
-      x.addEventListener(ev, function() {
-        if (ev === 'play' && window.RajBridge.nativeVideoPlay) RajBridge.nativeVideoPlay();
-        if (ev === 'pause' && window.RajBridge.nativeVideoPause) RajBridge.nativeVideoPause();
-        if (ev === 'seeking' && window.RajBridge.nativeVideoSeek) RajBridge.nativeVideoSeek(Number(x.currentTime) || 0);
-        if (ev === 'ratechange' && window.RajBridge.nativeVideoRate) RajBridge.nativeVideoRate(Number(x.playbackRate) || 1);
-      }, true);
-    });
-    x.addEventListener('ended', function(){
-      if (window.RajBridge.nativeVideoEnded) RajBridge.nativeVideoEnded();
-    }, true);
-    // The HTML element is intentionally not the decoder anymore. Stop WebView codec
-    // errors from reaching the app's old error UI while Media3 handles the real file.
-    x.addEventListener('error', function(e){ e.preventDefault(); e.stopImmediatePropagation(); }, true);
-    tellLayout();
-  }
-  var proto = HTMLMediaElement.prototype;
-  if (!proto.__rajNativePatched) {
-    var originalPlay = proto.play;
-    var originalPause = proto.pause;
-    proto.play = function() {
-      if (this.tagName === 'VIDEO') { attach(this); if (window.RajBridge.nativeVideoPlay) RajBridge.nativeVideoPlay(); return Promise.resolve(); }
-      return originalPlay.apply(this, arguments);
-    };
-    proto.pause = function() {
-      if (this.tagName === 'VIDEO') { attach(this); if (window.RajBridge.nativeVideoPause) RajBridge.nativeVideoPause(); return; }
-      return originalPause.apply(this, arguments);
-    };
-    proto.__rajNativePatched = true;
-  }
-  try {
-    Object.defineProperty(proto, 'currentTime', { configurable: true, get: function(){ return this.tagName === 'VIDEO' ? state.time : 0; }, set: function(t){ if (this.tagName === 'VIDEO' && window.RajBridge.nativeVideoSeek) RajBridge.nativeVideoSeek(Number(t) || 0); } });
-  } catch (_) {}
-  try {
-    Object.defineProperty(proto, 'duration', { configurable: true, get: function(){ return this.tagName === 'VIDEO' ? state.duration : NaN; } });
-  } catch (_) {}
-  try {
-    Object.defineProperty(proto, 'paused', { configurable: true, get: function(){ return this.tagName === 'VIDEO' ? state.paused : true; } });
-  } catch (_) {}
-  var mo = new MutationObserver(function(){ var x=v(); if(x) attach(x); tellLayout(); });
-  mo.observe(document.documentElement || document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['src','style','class']});
-  window.addEventListener('resize', tellLayout);
-  window.addEventListener('scroll', tellLayout, true);
-  window.__rajNativeVideoUpdate = function(t,d,p,r){
-    state.time = Number(t) || 0; state.duration = Number(d); state.paused = !!p; state.rate = Number(r) || 1;
-    var x=v(); if(!x) return;
-    ['loadedmetadata','durationchange','timeupdate'].forEach(function(ev){ try{x.dispatchEvent(new Event(ev));}catch(_){}});
-    try{x.dispatchEvent(new Event(state.paused ? 'pause' : 'play'));}catch(_){}
-  };
-  setInterval(function(){ var x=v(); if(x){ attach(x); tellLayout(); } }, 1000);
-})();
-"""
 
         // Lets a page save files it creates (backups, PDFs) to Downloads. Android's WebView cannot do this alone.
         private const val DOWNLOAD_HOOK_JS = """
@@ -180,16 +98,13 @@ class AppActivity : AppCompatActivity() {
     private lateinit var root: FrameLayout
     private lateinit var web: WebView
     private lateinit var loader: WebViewAssetLoader
+    private lateinit var nv: NativeVideo
 
     private var customView: View? = null
     private var customCallback: WebChromeClient.CustomViewCallback? = null
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private var lastBack = 0L
     private var ready = false
-    private var nativePlayer: ExoPlayer? = null
-    private var nativePlayerView: PlayerView? = null
-    private val nativeHandler = Handler(Looper.getMainLooper())
-    private var nativeVideoAttached = false
 
     private val chooser = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val cb = fileCallback
@@ -197,232 +112,12 @@ class AppActivity : AppCompatActivity() {
         cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
     }
 
-    // ==== ANCHOR: remembered video (native Media3 playback; no MKV conversion) ====
+    // ==== ANCHOR: remembered video (played by the native ExoPlayer, see NativeVideo.kt) ====
     private val videoPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val uri = r.data?.data
         if (r.resultCode != RESULT_OK || uri == null) return@registerForActivityResult
-
-        val info = readVideoInfo(uri)
-        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
-        val key = app.id
-        var persisted = false
-        try {
-            val flags = (r.data?.flags ?: 0) and Intent.FLAG_GRANT_READ_URI_PERMISSION
-            contentResolver.takePersistableUriPermission(
-                uri,
-                if (flags != 0) flags else Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
-            persisted = contentResolver.persistedUriPermissions.any { it.uri == uri && (it.isReadPermission || it.isWritePermission) }
-        } catch (_: Exception) { persisted = false }
-
-        deletePrivateVideo(key)
-        if (persisted) {
-            sp.edit().putString("vid_uri_$key", uri.toString()).remove("vid_path_$key")
-                .putString("vid_name_$key", info.first).putLong("vid_size_$key", info.second)
-                .putLong("vid_stamp_$key", System.currentTimeMillis()).apply()
-            Toast.makeText(this, "Video remembered. Playing original file directly.", Toast.LENGTH_SHORT).show()
-            loadNativeVideo()
-            sendSavedVideoToPage(false)
-        } else {
-            Toast.makeText(this, "Saving video for future launches…", Toast.LENGTH_SHORT).show()
-            Bg.run {
-                try {
-                    val dir = File(filesDir, "remembered_videos").apply { mkdirs() }
-                    val safeName = (info.first.ifBlank { "video" }).replace(Regex("[^A-Za-z0-9._-]"), "_")
-                    val dst = File(dir, "${key}_${System.currentTimeMillis()}_$safeName")
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        BufferedInputStream(input, 1024 * 1024).use { bin ->
-                            FileOutputStream(dst).use { out ->
-                                val buf = ByteArray(1024 * 1024)
-                                while (true) {
-                                    val n = bin.read(buf)
-                                    if (n < 0) break
-                                    out.write(buf, 0, n)
-                                }
-                                out.fd.sync()
-                            }
-                        }
-                    } ?: throw IOException("Could not read selected video")
-                    sp.edit().remove("vid_uri_$key").putString("vid_path_$key", dst.absolutePath)
-                        .putString("vid_name_$key", info.first).putLong("vid_size_$key", if (info.second > 0) info.second else dst.length())
-                        .putLong("vid_stamp_$key", System.currentTimeMillis()).apply()
-                    runOnUiThread {
-                        Toast.makeText(this, "Video saved. Original MKV will play directly after reopening.", Toast.LENGTH_LONG).show()
-                        loadNativeVideo()
-                        sendSavedVideoToPage(false)
-                    }
-                } catch (e: Exception) {
-                    Log.e("RajHubVideo", "Private video copy failed", e)
-                    runOnUiThread { Toast.makeText(this, "Could not save video: ${e.message ?: "unknown error"}", Toast.LENGTH_LONG).show() }
-                }
-            }
-        }
-    }
-
-    private fun savedVideoUri(): Uri? {
-        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
-        val path = sp.getString("vid_path_${app.id}", null)
-        if (!path.isNullOrBlank()) {
-            val f = File(path)
-            if (f.isFile && f.canRead()) return Uri.fromFile(f)
-        }
-        val uri = sp.getString("vid_uri_${app.id}", null)
-        return uri?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
-    }
-
-    private fun sendSavedVideoToPage(restored: Boolean) {
-        val json = savedVideoJson(restored)
-        if (json.isNotEmpty() && ::web.isInitialized) {
-            web.evaluateJavascript("window.__onNativeVideo && window.__onNativeVideo($json)", null)
-        }
-    }
-
-    private fun privateVideoFile(): File? {
-        val path = getSharedPreferences("rajhub", MODE_PRIVATE).getString("vid_path_${app.id}", null) ?: return null
-        return File(path).takeIf { it.isFile && it.canRead() }
-    }
-
-    private fun deletePrivateVideo(id: String) {
-        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
-        sp.getString("vid_path_$id", null)?.let { try { File(it).delete() } catch (_: Exception) {} }
-        sp.edit().remove("vid_path_$id").apply()
-    }
-
-    private fun openSavedVideoPfd(): ParcelFileDescriptor? {
-        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
-        val path = sp.getString("vid_path_${app.id}", null)
-        if (!path.isNullOrBlank()) {
-            val f = File(path)
-            if (f.isFile && f.canRead()) return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
-        }
-        val uriStr = sp.getString("vid_uri_${app.id}", null)
-        if (!uriStr.isNullOrBlank()) return contentResolver.openFileDescriptor(Uri.parse(uriStr), "r")
-        return null
-    }
-
-    private fun readVideoInfo(uri: Uri): Pair<String, Long> {
-        var name = "video"
-        var size = -1L
-        try {
-            contentResolver.query(uri, null, null, null, null)?.use { c ->
-                if (c.moveToFirst()) {
-                    val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (ni >= 0) name = c.getString(ni) ?: name
-                    val si = c.getColumnIndex(OpenableColumns.SIZE)
-                    if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
-                }
-            }
-        } catch (e: Exception) {
-            // keep defaults
-        }
-        if (size < 0) {
-            try {
-                contentResolver.openFileDescriptor(uri, "r")?.use { size = it.statSize }
-            } catch (e: Exception) {
-                // keep -1
-            }
-        }
-        return Pair(name, size)
-    }
-
-
-    private fun ensureNativePlayer() {
-        if (nativePlayer != null) return
-        nativePlayer = ExoPlayer.Builder(this).build().also { player ->
-            player.addListener(object : Player.Listener {
-                override fun onPlaybackStateChanged(state: Int) {
-                    if (state == Player.STATE_READY) nativeVideoAttached = true
-                    if (state == Player.STATE_ENDED) web.evaluateJavascript("window.__rajNativeVideoUpdate && window.__rajNativeVideoUpdate(${player.currentPosition / 1000.0},${if (player.duration > 0) player.duration / 1000.0 else "NaN"},true,${player.playbackParameters.speed})", null)
-                }
-                override fun onIsPlayingChanged(isPlaying: Boolean) { pushNativeVideoState() }
-            })
-        }
-        nativePlayerView = PlayerView(this).apply {
-            player = nativePlayer
-            useController = true
-            setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
-            setBackgroundColor(Color.BLACK)
-            visibility = View.GONE
-        }
-        root.addView(nativePlayerView, FrameLayout.LayoutParams(1, 1))
-    }
-
-    private fun loadNativeVideo() {
-        runOnUiThread {
-            ensureNativePlayer()
-            val uri = savedVideoUri()
-            if (uri == null) { nativePlayerView?.visibility = View.GONE; return@runOnUiThread }
-            val item = MediaItem.Builder().setUri(uri).build()
-            nativePlayer?.setMediaItem(item)
-            nativePlayer?.prepare()
-            nativePlayer?.playWhenReady = false
-            nativePlayerView?.visibility = View.VISIBLE
-            pushNativeVideoState()
-        }
-    }
-
-    private fun pushNativeVideoState() {
-        val p = nativePlayer ?: return
-        if (!::web.isInitialized) return
-        val t = p.currentPosition / 1000.0
-        val d = if (p.duration > 0) p.duration / 1000.0 else "NaN"
-        val paused = !p.isPlaying
-        web.evaluateJavascript("window.__rajNativeVideoUpdate && window.__rajNativeVideoUpdate($t,$d,$paused,${p.playbackParameters.speed})", null)
-    }
-
-    private fun startNativeTicker() {
-        nativeHandler.removeCallbacksAndMessages(null)
-        nativeHandler.post(object : Runnable {
-            override fun run() {
-                if (!isFinishing && !isDestroyed) {
-                    pushNativeVideoState()
-                    nativeHandler.postDelayed(this, 250)
-                }
-            }
-        })
-    }
-
-    private fun layoutNativeVideo(x: Float, y: Float, w: Float, h: Float) {
-        val pv = nativePlayerView ?: return
-        val density = resources.displayMetrics.density
-        val left = (x * density).toInt().coerceAtLeast(0)
-        val top = (y * density).toInt().coerceAtLeast(0)
-        val width = (w * density).toInt().coerceAtLeast(1)
-        val height = (h * density).toInt().coerceAtLeast(1)
-        val lp = (pv.layoutParams as FrameLayout.LayoutParams)
-        lp.leftMargin = left; lp.topMargin = top; lp.width = width; lp.height = height
-        pv.layoutParams = lp
-        pv.visibility = if (savedVideoUri() != null) View.VISIBLE else View.GONE
-    }
-
-    /** JSON for the remembered video, or "" when there is none or it is no longer readable. */
-    private fun savedVideoJson(restored: Boolean = true): String {
-        val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
-        val path = sp.getString("vid_path_${app.id}", null)
-        val uriStr = sp.getString("vid_uri_${app.id}", null)
-        return try {
-            val pfd = openSavedVideoPfd() ?: return ""
-            val size = if (pfd.statSize > 0) pfd.statSize else sp.getLong("vid_size_${app.id}", 0L)
-            pfd.close()
-            val o = JSONObject()
-            o.put("name", sp.getString("vid_name_${app.id}", "video") ?: "video")
-            o.put("size", size)
-            o.put("stamp", sp.getLong("vid_stamp_${app.id}", 0L))
-            o.put("restored", restored)
-            o.toString()
-        } catch (e: Exception) {
-            // A provider URI may have expired. If a private copy is missing too, forget it.
-            if (!path.isNullOrBlank() && !File(path).exists()) {
-                sp.edit().remove("vid_path_${app.id}").apply()
-            }
-            if (!uriStr.isNullOrBlank()) {
-                try {
-                    val u = Uri.parse(uriStr)
-                    contentResolver.releasePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                } catch (_: Exception) {}
-            }
-            ""
-        }
+        // keeps access with a persistable permission (no copy); falls back to a private copy only if Android refuses
+        if (::nv.isInitialized) nv.onPicked(uri)
     }
 
     private fun videoMime(name: String): String {
@@ -442,8 +137,9 @@ class AppActivity : AppCompatActivity() {
     /** Streams the remembered video to the page with HTTP Range support so seeking works on multi-GB files. */
     private fun serveVideo(req: WebResourceRequest): WebResourceResponse {
         val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
+        val uriStr = sp.getString("vid_uri_" + app.id, null) ?: return notFound()
         return try {
-            val pfd = openSavedVideoPfd() ?: return notFound()
+            val pfd = contentResolver.openFileDescriptor(Uri.parse(uriStr), "r") ?: return notFound()
             var total = pfd.statSize
             if (total <= 0) total = sp.getLong("vid_size_" + app.id, 0L)
             if (total <= 0) {
@@ -578,7 +274,13 @@ class AppActivity : AppCompatActivity() {
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0B1020"))
         web = WebView(this)
-        root.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        // Native video panel on top (hidden until a video is opened), the web page below it.
+        nv = NativeVideo(this, app.id, web) { js -> web.evaluateJavascript(js, null) }
+        val column = LinearLayout(this)
+        column.orientation = LinearLayout.VERTICAL
+        column.addView(nv.panel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        column.addView(web, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(root)
 
         // Full screen: the page draws edge to edge (under the camera notch too). Only the keyboard pushes it up.
@@ -588,6 +290,8 @@ class AppActivity : AppCompatActivity() {
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             v.setPadding(0, 0, 0, ime.bottom)
+            val cut = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
+            nv.setInsets(cut.left, cut.top, cut.right)
             insets
         }
 
@@ -602,6 +306,7 @@ class AppActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                if (nv.handleBack()) return
                 if (customView != null) {
                     hideCustomView()
                     return
@@ -669,13 +374,6 @@ class AppActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 view?.evaluateJavascript(DOWNLOAD_HOOK_JS, null)
-                view?.evaluateJavascript(NATIVE_VIDEO_HOOK_JS, null)
-                // Restore and play the original saved file through native Media3; no MKV conversion.
-                view?.postDelayed({
-                    loadNativeVideo()
-                    sendSavedVideoToPage(true)
-                }, 180)
-                startNativeTicker()
             }
 
             // A very big video can make Android kill the page's render process. Without this the whole app crashes.
@@ -918,44 +616,64 @@ class AppActivity : AppCompatActivity() {
             }
         }
 
-        /** JSON of the remembered video, or an empty string. */
+        /** JSON of the remembered video, or an empty string (also empty when the file can no longer be opened). */
         @JavascriptInterface
-        fun getSavedVideo(): String = savedVideoJson()
+        fun getSavedVideo(): String = if (ready) nv.savedJson() else ""
+
+        /** Name of a remembered video that can no longer be opened, so the page can tell the user which one to pick again. */
+        @JavascriptInterface
+        fun getMissingVideoName(): String = if (ready) nv.missingName() else ""
 
         @JavascriptInterface
         fun forgetVideo() {
-            val sp = getSharedPreferences("rajhub", MODE_PRIVATE)
-            val uri = sp.getString("vid_uri_${app.id}", null)?.let { Uri.parse(it) }
-            try { if (uri != null) contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
-            deletePrivateVideo(app.id)
-            nativePlayer?.stop()
-            nativePlayerView?.visibility = View.GONE
-            sp.edit()
-                .remove("vid_uri_${app.id}").remove("vid_name_${app.id}")
-                .remove("vid_size_${app.id}").remove("vid_stamp_${app.id}").apply()
+            runOnUiThread { if (ready) nv.forget() }
+            getSharedPreferences("rajhub", MODE_PRIVATE).edit()
+                .remove("vid_uri_" + app.id).remove("vid_name_" + app.id)
+                .remove("vid_size_" + app.id).remove("vid_stamp_" + app.id).apply()
+        }
+
+        // ---- native player (ExoPlayer) controls used by the page ----
+
+        /** Opens the remembered video in the native player. Returns false when there is nothing usable to open. */
+        @JavascriptInterface
+        fun nvOpen(): Boolean {
+            if (!ready) return false
+            val ok = nv.canResolve()
+            if (ok) runOnUiThread { nv.openSaved() }
+            return ok
+        }
+
+        /** op: play | pause | seek (arg = milliseconds) | speed (arg = 1.0 normal) | retry. seq lets the page match replies. */
+        @JavascriptInterface
+        fun nvCmd(seq: Double, op: String?, arg: Double) {
+            val o = op ?: return
+            runOnUiThread { if (ready) nv.cmd(seq.toInt(), o, arg) }
         }
 
         @JavascriptInterface
-        fun nativeVideoLayout(x: Float, y: Float, width: Float, height: Float) {
-            runOnUiThread { layoutNativeVideo(x, y, width, height) }
+        fun nvVisible(on: Boolean) {
+            runOnUiThread { if (ready) nv.setVisible(on) }
         }
 
         @JavascriptInterface
-        fun nativeVideoPlay() { runOnUiThread { nativePlayer?.play() } }
-
-        @JavascriptInterface
-        fun nativeVideoPause() { runOnUiThread { nativePlayer?.pause() } }
-
-        @JavascriptInterface
-        fun nativeVideoSeek(seconds: Double) {
-            runOnUiThread { nativePlayer?.seekTo((seconds.coerceAtLeast(0.0) * 1000.0).toLong()) }
+        fun nvControls(on: Boolean) {
+            runOnUiThread { if (ready) nv.setControls(on) }
         }
 
         @JavascriptInterface
-        fun nativeVideoRate(rate: Double) { runOnUiThread { nativePlayer?.setPlaybackSpeed(rate.toFloat().coerceIn(0.25f, 4f)) } }
+        fun nvMute(on: Boolean) {
+            runOnUiThread { if (ready) nv.setMuted(on) }
+        }
 
         @JavascriptInterface
-        fun nativeVideoEnded() { runOnUiThread { nativePlayer?.seekTo(0); nativePlayer?.pause() } }
+        fun nvOverlay(text: String?, sizePct: Double, opacity: Double, on: Boolean) {
+            runOnUiThread { if (ready) nv.setOverlay(text, sizePct, opacity, on) }
+        }
+
+        @JavascriptInterface
+        fun nvFx(mirror: Boolean, blurCssPx: Double, oldTv: Boolean) {
+            runOnUiThread { if (ready) nv.setFx(mirror, blurCssPx, oldTv) }
+        }
 
         @JavascriptInterface
         fun notify(title: String, text: String) {
@@ -998,15 +716,21 @@ class AppActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        if (ready) web.onPause()
+        if (ready) {
+            nv.onPause()
+            web.onPause()
+        }
         super.onPause()
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (ready) nv.relayout()
+    }
+
     override fun onDestroy() {
-        nativeHandler.removeCallbacksAndMessages(null)
-        nativePlayer?.release()
-        nativePlayer = null
         if (ready) {
+            nv.release()
             root.removeAllViews()
             web.destroy()
         }
