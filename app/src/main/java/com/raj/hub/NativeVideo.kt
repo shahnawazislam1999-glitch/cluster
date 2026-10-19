@@ -25,7 +25,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.TextView
+import android.widget.ImageView
 import android.widget.Toast
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
@@ -104,22 +104,20 @@ class NativeVideo(
     // audio language switching (dual audio MKV, e.g. English / Hindi)
     private var audioList: List<Tracks.Group> = emptyList()
     private var audioPrefApplied = false
-    private val audioChip = TextView(act)
+    private val audioChip = ImageView(act)
 
     init {
         panel.visibility = View.GONE
         panel.addView(tiles, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        audioChip.setTextColor(Color.WHITE)
-        audioChip.textSize = 13f
-        audioChip.setPadding(dp(12), dp(6), dp(12), dp(6))
-        val chipBg = GradientDrawable()
-        chipBg.setColor(0x99000000.toInt())
-        chipBg.cornerRadius = dp(16).toFloat()
-        audioChip.background = chipBg
+        // only a small speaker icon, very faint (10% opacity) so it does not distract from the picture
+        audioChip.setImageResource(R.drawable.ic_audio_track)
+        audioChip.alpha = 0.10f
+        audioChip.setPadding(dp(10), dp(10), dp(10), dp(10))
+        audioChip.contentDescription = "Audio language"
         audioChip.visibility = View.GONE
         audioChip.setOnClickListener { showAudioDialog() }
-        val chipLp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END)
-        chipLp.setMargins(0, dp(8), dp(8), 0)
+        val chipLp = FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP or Gravity.END)
+        chipLp.setMargins(0, dp(4), dp(4), 0)
         panel.addView(audioChip, chipLp)
         playerView.setFullscreenButtonClickListener { setFullscreen(!fullscreen) }
         playerView.subtitleView?.visibility = View.GONE
@@ -312,7 +310,6 @@ class NativeVideo(
             }
         }
         val sel = list.indexOfFirst { it.isSelected }.coerceAtLeast(0)
-        audioChip.text = "🔊 " + audioName(list[sel], sel) + " ▾"
         audioChip.visibility = View.VISIBLE
     }
 
